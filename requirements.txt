@@ -1,0 +1,22 @@
+# Core audio + wake word
+numpy
+pyaudio
+openwakeword==0.6.0
+
+# STT (Whisper ONNX via Qualcomm AI Hub)
+qai-hub
+qai-hub-models
+onnxruntime-qnn
+torch>=2.2.0
+
+# Translation
+transformers>=4.38.0
+sentencepiece
+
+# TTS
+pyttsx3
+
+# YOLOv8 + optional LM Studio helper
+ultralytics
+opencv-python
+lmstudio
