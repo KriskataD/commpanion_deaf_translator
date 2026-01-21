@@ -5,10 +5,6 @@ import importlib.util
 
 import torch
 
-from qai_hub_models.models._shared.whisper.app import WhisperApp
-from qai_hub_models.models.whisper_base_en.model import WhisperBaseEn
-from qai_hub_models.utils.onnx_torch_wrapper import OnnxModelTorchWrapper
-
 
 class _AudioRecordMixin:
     def __init__(self, audio_records_path: Path | str | None) -> None:
@@ -67,18 +63,7 @@ class SpeechToTextApplication(_AudioRecordMixin):
         """
         super().__init__(audio_records_path)
 
-        if model_name == "whisper_base_en":
-            self.model = WhisperBaseEn.from_pretrained()
-            encoder_filename = "whisper_base_en-whisperencoderinf.onnx"
-            decoder_filename = "whisper_base_en-whisperdecoderinf.onnx"
-        elif model_name == "whisper_base":
-            self.model = _load_whisper_base_model()
-            encoder_filename = "whisper_base-whisperencoderinf.onnx"
-            decoder_filename = "whisper_base-whisperdecoderinf.onnx"
-        else:
-            raise ValueError(
-                "Unsupported Whisper model name. Use 'whisper_base_en' or 'whisper_base'."
-            )
+        whisper_model, encoder_filename, decoder_filename = _load_qai_whisper_assets(model_name)
 
         base_models_dir = (
             Path(models_dir) if models_dir is not None else Path(__file__).parent / "models"
@@ -86,13 +71,14 @@ class SpeechToTextApplication(_AudioRecordMixin):
         encoder_path = base_models_dir / encoder_filename
         decoder_path = base_models_dir / decoder_filename
 
+        WhisperApp, OnnxModelTorchWrapper = _load_qai_whisper_runtime()
         self.app = WhisperApp(
             OnnxModelTorchWrapper.OnNPU(str(encoder_path)),
             OnnxModelTorchWrapper.OnNPU(str(decoder_path)),
-            num_decoder_blocks=self.model.num_decoder_blocks,
-            num_decoder_heads=self.model.num_decoder_heads,
-            attention_dim=self.model.attention_dim,
-            mean_decode_len=self.model.mean_decode_len,
+            num_decoder_blocks=whisper_model.num_decoder_blocks,
+            num_decoder_heads=whisper_model.num_decoder_heads,
+            attention_dim=whisper_model.attention_dim,
+            mean_decode_len=whisper_model.mean_decode_len,
         )
 
     def transcribe(self) -> str:
@@ -149,8 +135,6 @@ class OpenAIWhisperSpeechToText(_AudioRecordMixin):
         return transcription
 
 
-
-
 def is_whisper_base_available() -> bool:
     """Return True if the multilingual whisper_base module can be imported."""
     return (
@@ -162,42 +146,63 @@ def is_whisper_base_available() -> bool:
 def _load_whisper_base_model():
     try:
         whisper_base_module = importlib.import_module("qai_hub_models.models.whisper_base")
-
     except ModuleNotFoundError as exc:
         try:
             whisper_base_module = importlib.import_module(
-
                 "qai_hub_models.models.whisper_base.model"
             )
-
         except ModuleNotFoundError as nested_exc:
             raise RuntimeError(
-
                 "whisper_base is unavailable in the installed qai-hub-models package. "
-
                 "Please upgrade qai-hub-models or install a version that includes "
-
                 "qai_hub_models.models.whisper_base."
             ) from nested_exc
-
     model_cls = getattr(whisper_base_module, "Model", None) or getattr(
-
         whisper_base_module, "WhisperBase", None
-
     )
-
     if model_cls is None:
-
         raise RuntimeError(
-
             "whisper_base model class not found. Expected Model or WhisperBase in "
-
             "qai_hub_models.models.whisper_base."
-
         )
-
     return model_cls.from_pretrained()
+
 
 def is_openai_whisper_available() -> bool:
     """Return True if the OpenAI Whisper package can be imported."""
     return importlib.util.find_spec("whisper") is not None
+
+
+def _load_qai_whisper_runtime():
+    try:
+        from qai_hub_models.models._shared.whisper.app import WhisperApp
+        from qai_hub_models.utils.onnx_torch_wrapper import OnnxModelTorchWrapper
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "qai-hub-models is not installed. Install it with `pip install qai-hub-models` "
+            "to use the ONNX Whisper backend."
+        ) from exc
+    return WhisperApp, OnnxModelTorchWrapper
+
+
+def _load_qai_whisper_assets(model_name: str):
+    if model_name == "whisper_base_en":
+        try:
+            from qai_hub_models.models.whisper_base_en.model import WhisperBaseEn
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "qai-hub-models is not installed. Install it with `pip install qai-hub-models` "
+                "to use the ONNX Whisper backend."
+            ) from exc
+        model = WhisperBaseEn.from_pretrained()
+        encoder_filename = "whisper_base_en-whisperencoderinf.onnx"
+        decoder_filename = "whisper_base_en-whisperdecoderinf.onnx"
+    elif model_name == "whisper_base":
+        model = _load_whisper_base_model()
+        encoder_filename = "whisper_base-whisperencoderinf.onnx"
+        decoder_filename = "whisper_base-whisperdecoderinf.onnx"
+    else:
+        raise ValueError(
+            "Unsupported Whisper model name. Use 'whisper_base_en' or 'whisper_base'."
+        )
+    return model, encoder_filename, decoder_filename
