@@ -8,6 +8,7 @@ qai-hub>=0.31.0
 qai-hub-models>=0.31.0
 onnxruntime-qnn
 torch>=2.2.0
+openai-whisper
 
 # Translation
 transformers>=4.38.0

@@ -5,7 +5,7 @@ Wake-word controlled pipeline that records speech, transcribes it with Whisper (
 ## Layout
 - `src/wake_translation_assistant.py` – wake-word loop that routes to translation (sign-language branch placeholder).
 - `src/translator.py` – record → STT → translate → TTS pipeline.
-- `src/stt.py` – Whisper ONNX runner (place ONNX exports in `src/models/`).
+- `src/stt.py` – Whisper ONNX runner + OpenAI Whisper (local) integration.
 - `src/tts.py` – pyttsx3 helper.
 - `src/recorder.py` – microphone capture with silence detection.
 - `src/wakeword_detector.py` – openWakeWord wrapper.
@@ -15,6 +15,7 @@ Wake-word controlled pipeline that records speech, transcribes it with Whisper (
 1) Python 3.10+ recommended.  
 2) Install deps: `pip install -r requirements.txt` (PyAudio may need OS-specific tooling).  
    - To upgrade Qualcomm AI Hub packages explicitly: `pip install -U qai-hub qai-hub-models`
+   - OpenAI Whisper (local) requires `ffmpeg` available on your system for audio decoding.
 3) Models:
    - Whisper ONNX:
      - English-only: export `whisper_base_en-whisperencoderinf.onnx` and `whisper_base_en-whisperdecoderinf.onnx` into `src/models/`.
@@ -40,6 +41,11 @@ For non-English source languages (e.g., Bulgarian), either let the default auto-
 choose the multilingual Whisper model or set it explicitly:
 ```bash
 python -m src.translator --source-lang bg --target-lang en --stt-model whisper_base --once
+```
+
+To use the OpenAI Whisper open-source model locally:
+```bash
+python -m src.translator --source-lang en --target-lang fr --stt-model openai_whisper:base --once
 ```
 
 ## Notes
