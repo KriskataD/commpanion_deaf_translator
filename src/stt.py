@@ -3,6 +3,7 @@ from pathlib import Path
 import importlib
 
 from qai_hub_models.models._shared.whisper.app import WhisperApp
+from qai_hub_models.models.whisper_base.model import WhisperBase
 from qai_hub_models.models.whisper_base_en.model import WhisperBaseEn
 from qai_hub_models.utils.onnx_torch_wrapper import OnnxModelTorchWrapper
 
