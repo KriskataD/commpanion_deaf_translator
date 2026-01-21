@@ -6,7 +6,7 @@ import torch
 
 
 class SpeechToTextApplication:
-    """Speech-to-text using the OpenAI Whisper open-source model."""
+    """Speech-to-text using the OpenAI Whisper open-source model. """
 
     def __init__(
         self,
