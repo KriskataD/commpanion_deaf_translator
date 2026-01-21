@@ -3,7 +3,6 @@ from pathlib import Path
 import importlib
 
 from qai_hub_models.models._shared.whisper.app import WhisperApp
-from qai_hub_models.models.whisper_base.model import WhisperBase
 from qai_hub_models.models.whisper_base_en.model import WhisperBaseEn
 from qai_hub_models.utils.onnx_torch_wrapper import OnnxModelTorchWrapper
 
@@ -32,9 +31,16 @@ class SpeechToTextApplication:
             encoder_filename = "whisper_base_en-whisperencoderinf.onnx"
             decoder_filename = "whisper_base_en-whisperdecoderinf.onnx"
         elif model_name == "whisper_base":
-            whisper_base_module = importlib.import_module(
-                "qai_hub_models.models.whisper_base.model"
-            )
+            try:
+                whisper_base_module = importlib.import_module(
+                    "qai_hub_models.models.whisper_base.model"
+                )
+            except ModuleNotFoundError as exc:
+                raise RuntimeError(
+                    "whisper_base is unavailable in the installed qai-hub-models package. "
+                    "Please upgrade qai-hub-models or install a version that includes "
+                    "qai_hub_models.models.whisper_base."
+                ) from exc
             self.model = whisper_base_module.WhisperBase.from_pretrained()
             encoder_filename = "whisper_base-whisperencoderinf.onnx"
             decoder_filename = "whisper_base-whisperdecoderinf.onnx"
