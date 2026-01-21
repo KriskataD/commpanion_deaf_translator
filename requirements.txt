@@ -3,10 +3,7 @@ numpy
 pyaudio
 openwakeword==0.6.0
 
-# STT (Whisper ONNX via Qualcomm AI Hub)
-qai-hub>=0.31.0
-qai-hub-models>=0.31.0
-onnxruntime-qnn
+# STT (OpenAI Whisper local)
 torch>=2.2.0
 openai-whisper
 
