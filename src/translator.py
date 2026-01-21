@@ -16,7 +16,12 @@ import torch
 from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
 
 from .recorder import AudioRecorder
-from .stt import SpeechToTextApplication, is_whisper_base_available
+from .stt import (
+    OpenAIWhisperSpeechToText,
+    SpeechToTextApplication,
+    is_openai_whisper_available,
+    is_whisper_base_available,
+)
 from .tts import _TTS
 
 
@@ -68,25 +73,47 @@ class TranslatorPipeline:
         self.speak = speak
 
         self.recorder = AudioRecorder()
-        if stt_model:
-            selected_stt_model = stt_model
-        else:
-            prefers_english = source_lang.lower().startswith("en")
-            if prefers_english:
-                selected_stt_model = "whisper_base_en"
-            elif is_whisper_base_available():
-                selected_stt_model = "whisper_base"
+        selected_stt_model = stt_model
+        if selected_stt_model is None:
+            if is_openai_whisper_available():
+                selected_stt_model = "openai_whisper:base"
             else:
-                selected_stt_model = "whisper_base_en"
-                print(
-                    "⚠️ Multilingual whisper_base model is unavailable; falling back to "
-                    "whisper_base_en. Upgrade qai-hub-models or install a version that "
-                    "includes qai_hub_models.models.whisper_base for non-English STT."
+                selected_stt_model = None
+
+        if selected_stt_model and selected_stt_model.startswith("openai_whisper"):
+            if not is_openai_whisper_available():
+                raise RuntimeError(
+                    "openai-whisper is not installed. Install it with `pip install openai-whisper` "
+                    "or choose a Whisper ONNX model."
                 )
-        self.stt = SpeechToTextApplication(
-            audio_records_path=self.audio_dir,
-            model_name=selected_stt_model,
-        )
+            model_name = "base"
+            if ":" in selected_stt_model:
+                _, model_name = selected_stt_model.split(":", 1)
+            self.stt = OpenAIWhisperSpeechToText(
+                audio_records_path=self.audio_dir,
+                model_name=model_name,
+                language=source_lang if source_lang else None,
+            )
+        else:
+            if selected_stt_model:
+                onnx_model = selected_stt_model
+            else:
+                prefers_english = source_lang.lower().startswith("en")
+                if prefers_english:
+                    onnx_model = "whisper_base_en"
+                elif is_whisper_base_available():
+                    onnx_model = "whisper_base"
+                else:
+                    onnx_model = "whisper_base_en"
+                    print(
+                        "⚠️ Multilingual whisper_base model is unavailable; falling back to "
+                        "whisper_base_en. Upgrade qai-hub-models or install a version that "
+                        "includes qai_hub_models.models.whisper_base for non-English STT."
+                    )
+            self.stt = SpeechToTextApplication(
+                audio_records_path=self.audio_dir,
+                model_name=onnx_model,
+            )
         self.translator = MultiLanguageTranslator()
         self.tts = _TTS()
 
@@ -182,9 +209,10 @@ def main() -> None:
     parser.add_argument("--audio-dir", default="audio", help="Directory to save recordings.")
     parser.add_argument(
         "--stt-model",
-        choices=("whisper_base_en", "whisper_base"),
         help=(
-            "Whisper STT model to use. Defaults to whisper_base_en for English source, "
+            "Whisper STT model to use. Supported values: whisper_base_en, whisper_base, "
+            "or openai_whisper[:model] (e.g., openai_whisper:small). Defaults to "
+            "openai_whisper:base when available, otherwise whisper_base_en for English "
             "or whisper_base for other languages."
         ),
     )
