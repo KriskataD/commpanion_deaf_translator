@@ -9,3 +9,5 @@ export_assets/
 
 # Ignore all model artifacts
 src/models/
+
+audio/

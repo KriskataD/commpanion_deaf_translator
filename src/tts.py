@@ -1,5 +1,8 @@
+import os
 import re
 import time
+from pathlib import Path
+
 import pyttsx3
 
 CHUNK_REGEX = re.compile(r".*?[\.!?…](?:\s|$)")  # Regex to match complete sentence-like segments
@@ -16,8 +19,20 @@ class _TTS:
         Args:
             rate (int): Speed of speech in words per minute. Default is 200.
         """
-        self.engine = pyttsx3.init()
-        self.engine.setProperty('rate', rate)
+        if os.name == "nt":
+            _ensure_comtypes_cache()
+
+        try:
+            self.engine = pyttsx3.init()
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to initialize text-to-speech. If you're on Windows, ensure "
+                "`comtypes` and `pywin32` are installed and that the comtypes cache is "
+                "writable. Try reinstalling with `pip install --upgrade comtypes pywin32`."
+            ) from exc
+
+        self.engine.setProperty("rate", rate)
+
 
     def start(self, text_: str):
         """
@@ -29,6 +44,17 @@ class _TTS:
         print(f"🎤 Vocal synthesis: {text_}")
         self.engine.say(text_)
         self.engine.runAndWait()
+
+def _ensure_comtypes_cache() -> None:
+    if os.environ.get("COMTYPES_GEN_DIR"):
+        return
+
+    base_dir = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    gen_dir = base_dir / "comtypes_gen"
+    gen_dir.mkdir(parents=True, exist_ok=True)
+    init_file = gen_dir / "__init__.py"
+    init_file.touch(exist_ok=True)
+    os.environ["COMTYPES_GEN_DIR"] = str(gen_dir)
 
 
 def talk_stream(stream) -> str:

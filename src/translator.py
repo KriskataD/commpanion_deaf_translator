@@ -86,7 +86,7 @@ class TranslatorPipeline:
             language=source_lang if source_lang else None,
         )
         self.translator = MultiLanguageTranslator()
-        self.tts = _TTS()
+        self.tts = _TTS() if self.speak else None
 
         self._mic_lock = threading.Lock()
         default_mic = self.recorder.mic_selector.get_default_microphone()
@@ -119,7 +119,7 @@ class TranslatorPipeline:
 
     def translate_transcription(self, transcription: str) -> str:
         translated = self.translator.translate(transcription, self.source_lang, self.target_lang)
-        if self.speak and translated:
+        if self.speak and translated and self.tts:
             self.tts.start(translated)
         print(f"➡️  Translated ({self.source_lang} → {self.target_lang}): {translated}")
         return translated
@@ -128,7 +128,7 @@ class TranslatorPipeline:
         """Translate arbitrary text without invoking the STT step."""
 
         translated = self.translator.translate(text, self.source_lang, self.target_lang)
-        if self.speak and translated:
+        if self.speak and translated and self.tts:
             self.tts.start(translated)
         print(f"➡️  Translated text ({self.source_lang} → {self.target_lang}): {translated}")
         return translated
