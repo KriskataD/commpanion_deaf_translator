@@ -38,6 +38,11 @@ To use the OpenAI Whisper open-source model locally:
 python -m src.translator --source-lang en --target-lang fr --stt-model openai_whisper:base --once
 ```
 
+To use the OpenAI Whisper open-source model locally:
+```bash
+python -m src.translator --source-lang en --target-lang fr --stt-model openai_whisper:base --once
+```
+
 ## Notes
 - This repo focuses only on STT, translation, TTS, wake word, and YOLOv8 helpers extracted from `commpanion-blind-deaf`. Other intents (OCR, BLIP, collision detection, etc.) are omitted.  
 - The pipeline uses the first available microphone detected by PyAudio; adjust `MicrophoneSelector` or `TranslatorPipeline` if you need a specific device.  
