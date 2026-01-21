@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import importlib
+
 from qai_hub_models.models._shared.whisper.app import WhisperApp
 from qai_hub_models.models.whisper_base.model import WhisperBase
 from qai_hub_models.models.whisper_base_en.model import WhisperBaseEn
@@ -30,7 +32,10 @@ class SpeechToTextApplication:
             encoder_filename = "whisper_base_en-whisperencoderinf.onnx"
             decoder_filename = "whisper_base_en-whisperdecoderinf.onnx"
         elif model_name == "whisper_base":
-            self.model = WhisperBase.from_pretrained()
+            whisper_base_module = importlib.import_module(
+                "qai_hub_models.models.whisper_base.model"
+            )
+            self.model = whisper_base_module.WhisperBase.from_pretrained()
             encoder_filename = "whisper_base-whisperencoderinf.onnx"
             decoder_filename = "whisper_base-whisperdecoderinf.onnx"
         else:
