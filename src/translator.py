@@ -16,7 +16,7 @@ import torch
 from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
 
 from .recorder import AudioRecorder
-from .stt import SpeechToTextApplication
+from .stt import SpeechToTextApplication, is_whisper_base_available
 from .tts import _TTS
 
 
@@ -58,6 +58,7 @@ class TranslatorPipeline:
         source_lang: str = "en",
         target_lang: str = "fr",
         speak: bool = True,
+        stt_model: str | None = None,
     ) -> None:
         self.audio_dir = Path(audio_dir)
         self.audio_dir.mkdir(parents=True, exist_ok=True)
@@ -67,7 +68,25 @@ class TranslatorPipeline:
         self.speak = speak
 
         self.recorder = AudioRecorder()
-        self.stt = SpeechToTextApplication(audio_records_path=self.audio_dir)
+        if stt_model:
+            selected_stt_model = stt_model
+        else:
+            prefers_english = source_lang.lower().startswith("en")
+            if prefers_english:
+                selected_stt_model = "whisper_base_en"
+            elif is_whisper_base_available():
+                selected_stt_model = "whisper_base"
+            else:
+                selected_stt_model = "whisper_base_en"
+                print(
+                    "⚠️ Multilingual whisper_base model is unavailable; falling back to "
+                    "whisper_base_en. Upgrade qai-hub-models or install a version that "
+                    "includes qai_hub_models.models.whisper_base for non-English STT."
+                )
+        self.stt = SpeechToTextApplication(
+            audio_records_path=self.audio_dir,
+            model_name=selected_stt_model,
+        )
         self.translator = MultiLanguageTranslator()
         self.tts = _TTS()
 
@@ -161,6 +180,14 @@ def main() -> None:
     parser.add_argument("--source-lang", default="en", help="Source language code (e.g., en, fr, es).")
     parser.add_argument("--target-lang", default="fr", help="Target language code (e.g., fr, en, de).")
     parser.add_argument("--audio-dir", default="audio", help="Directory to save recordings.")
+    parser.add_argument(
+        "--stt-model",
+        choices=("whisper_base_en", "whisper_base"),
+        help=(
+            "Whisper STT model to use. Defaults to whisper_base_en for English source, "
+            "or whisper_base for other languages."
+        ),
+    )
     parser.add_argument("--no-speak", action="store_true", help="Disable TTS playback of translations.")
     parser.add_argument(
         "--list-languages",
@@ -180,6 +207,7 @@ def main() -> None:
         source_lang=args.source_lang,
         target_lang=args.target_lang,
         speak=not args.no_speak,
+        stt_model=args.stt_model,
     )
 
     if args.list_languages:
