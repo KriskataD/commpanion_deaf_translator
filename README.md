@@ -14,10 +14,12 @@ Wake-word controlled pipeline that records speech, transcribes it with Whisper (
 ## Setup
 1) Python 3.10+ recommended.  
 2) Install deps: `pip install -r requirements.txt` (PyAudio may need OS-specific tooling).  
+   - To upgrade Qualcomm AI Hub packages explicitly: `pip install -U qai-hub qai-hub-models`
 3) Models:
    - Whisper ONNX:
      - English-only: export `whisper_base_en-whisperencoderinf.onnx` and `whisper_base_en-whisperdecoderinf.onnx` into `src/models/`.
      - Multilingual (recommended for non-English input): export `whisper_base-whisperencoderinf.onnx` and `whisper_base-whisperdecoderinf.onnx` into `src/models/`.
+     - If `qai_hub_models.models.whisper_base` is missing, upgrade `qai-hub-models` to a version that includes the multilingual model.
    - Wake word: `openwakeword` downloads defaults on first run; to use a custom model, place it in `src/models/` and pass `--wakeword path/to/model.onnx`.
    - YOLO: download a YOLOv8 weights file (e.g., `yolov8l-oiv7.pt`) into `src/models/` and update `src/yolov8Objects.py` if you want to run it.
 

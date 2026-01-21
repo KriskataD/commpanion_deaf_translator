@@ -4,8 +4,8 @@ pyaudio
 openwakeword==0.6.0
 
 # STT (Whisper ONNX via Qualcomm AI Hub)
-qai-hub
-qai-hub-models
+qai-hub>=0.31.0
+qai-hub-models>=0.31.0
 onnxruntime-qnn
 torch>=2.2.0
 

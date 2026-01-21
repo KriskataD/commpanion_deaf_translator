@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import importlib
+import importlib.util
 
 from qai_hub_models.models._shared.whisper.app import WhisperApp
 from qai_hub_models.models.whisper_base_en.model import WhisperBaseEn
@@ -31,17 +32,7 @@ class SpeechToTextApplication:
             encoder_filename = "whisper_base_en-whisperencoderinf.onnx"
             decoder_filename = "whisper_base_en-whisperdecoderinf.onnx"
         elif model_name == "whisper_base":
-            try:
-                whisper_base_module = importlib.import_module(
-                    "qai_hub_models.models.whisper_base.model"
-                )
-            except ModuleNotFoundError as exc:
-                raise RuntimeError(
-                    "whisper_base is unavailable in the installed qai-hub-models package. "
-                    "Please upgrade qai-hub-models or install a version that includes "
-                    "qai_hub_models.models.whisper_base."
-                ) from exc
-            self.model = whisper_base_module.WhisperBase.from_pretrained()
+            self.model = _load_whisper_base_model()
             encoder_filename = "whisper_base-whisperencoderinf.onnx"
             decoder_filename = "whisper_base-whisperdecoderinf.onnx"
         else:
@@ -114,3 +105,36 @@ class SpeechToTextApplication:
         print(f"Transcription result: {transcription}")
         self._delete_audio_file()
         return transcription
+
+
+def is_whisper_base_available() -> bool:
+    """Return True if the multilingual whisper_base module can be imported."""
+    return (
+        importlib.util.find_spec("qai_hub_models.models.whisper_base") is not None
+        or importlib.util.find_spec("qai_hub_models.models.whisper_base.model") is not None
+    )
+
+
+def _load_whisper_base_model():
+    try:
+        whisper_base_module = importlib.import_module("qai_hub_models.models.whisper_base")
+    except ModuleNotFoundError as exc:
+        try:
+            whisper_base_module = importlib.import_module(
+                "qai_hub_models.models.whisper_base.model"
+            )
+        except ModuleNotFoundError as nested_exc:
+            raise RuntimeError(
+                "whisper_base is unavailable in the installed qai-hub-models package. "
+                "Please upgrade qai-hub-models or install a version that includes "
+                "qai_hub_models.models.whisper_base."
+            ) from nested_exc
+    model_cls = getattr(whisper_base_module, "Model", None) or getattr(
+        whisper_base_module, "WhisperBase", None
+    )
+    if model_cls is None:
+        raise RuntimeError(
+            "whisper_base model class not found. Expected Model or WhisperBase in "
+            "qai_hub_models.models.whisper_base."
+        )
+    return model_cls.from_pretrained()

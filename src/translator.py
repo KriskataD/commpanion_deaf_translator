@@ -16,7 +16,7 @@ import torch
 from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
 
 from .recorder import AudioRecorder
-from .stt import SpeechToTextApplication
+from .stt import SpeechToTextApplication, is_whisper_base_available
 from .tts import _TTS
 
 
@@ -68,9 +68,21 @@ class TranslatorPipeline:
         self.speak = speak
 
         self.recorder = AudioRecorder()
-        selected_stt_model = stt_model or (
-            "whisper_base_en" if source_lang.lower().startswith("en") else "whisper_base"
-        )
+        if stt_model:
+            selected_stt_model = stt_model
+        else:
+            prefers_english = source_lang.lower().startswith("en")
+            if prefers_english:
+                selected_stt_model = "whisper_base_en"
+            elif is_whisper_base_available():
+                selected_stt_model = "whisper_base"
+            else:
+                selected_stt_model = "whisper_base_en"
+                print(
+                    "⚠️ Multilingual whisper_base model is unavailable; falling back to "
+                    "whisper_base_en. Upgrade qai-hub-models or install a version that "
+                    "includes qai_hub_models.models.whisper_base for non-English STT."
+                )
         self.stt = SpeechToTextApplication(
             audio_records_path=self.audio_dir,
             model_name=selected_stt_model,
