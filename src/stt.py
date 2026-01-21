@@ -1,176 +1,208 @@
-# src/stt.py  (CPU-only Whisper multilingual via Optimum + ONNXRuntime)
-from __future__ import annotations
-
 from pathlib import Path
-from typing import Optional
-import os
-import wave
 
-import numpy as np
-from transformers import WhisperProcessor
-from optimum.onnxruntime import ORTModelForSpeechSeq2Seq
+import importlib
+import importlib.util
+
+import torch
 
 
-def is_whisper_base_available() -> bool:
-    """Kept for compatibility with translator.py logic."""
-    return True
+class _AudioRecordMixin:
+    def __init__(self, audio_records_path: Path | str | None) -> None:
+        if isinstance(audio_records_path, str):
+            self.audio_records_path: Path | None = Path(audio_records_path)
+        else:
+            self.audio_records_path = audio_records_path
+        self.last_audio_file: Path | None = None
+
+    def _get_audio_file(self) -> Path:
+        """
+        Retrieve the first .wav audio file from the records directory.
+
+        Returns:
+            Path: Path to the audio file.
+
+        Raises:
+            FileNotFoundError: If no audio files are found.
+        """
+        if self.audio_records_path is None:
+            raise ValueError("Audio records path is not set.")
+        audio_files = list(self.audio_records_path.glob("*.wav"))
+        if not audio_files:
+            raise FileNotFoundError("No audio files found.")
+        self.last_audio_file = audio_files[0]
+        return audio_files[0]
+
+    def _delete_audio_file(self) -> None:
+        """Delete the last processed audio file."""
+        if self.last_audio_file and self.last_audio_file.exists():
+            self.last_audio_file.unlink()
+            print(f"Deleted audio file: {self.last_audio_file}")
+            self.last_audio_file = None
+        else:
+            print("No audio file to delete or file does not exist.")
 
 
-class SpeechToTextApplication:
+class SpeechToTextApplication(_AudioRecordMixin):
     """
-    Transcribe speech from WAV files using multilingual Whisper-Base exported to ONNX.
-
-    Expects an Optimum ONNX export folder (default):
-      src/models/whisper_base_multilingual_onnx/
-
-    This is CPU-only (ONNXRuntime CPUExecutionProvider).
-
-    IMPORTANT:
-      Many Optimum versions expect a decoder_with_past ONNX file for generation.
-      If your export folder only contains:
-        - encoder_model.onnx
-        - decoder_model.onnx
-      then you must explicitly pass encoder_file_name/decoder_file_name (if supported),
-      otherwise use the manual ONNXRuntime decoding implementation.
+    Application for transcribing speech from audio files using WhisperBase models.
     """
 
     def __init__(
         self,
         audio_records_path: Path | str | None = None,
         models_dir: Path | str | None = None,
-        model_name: str = "whisper_base",
+        model_name: str = "whisper_base_en",
     ) -> None:
-        # Keep API compatible with your translator.py (model_name accepted but not required here).
-        if isinstance(audio_records_path, str):
-            self.audio_records_path: Path | None = Path(audio_records_path)
-        else:
-            self.audio_records_path: Path | None = audio_records_path
+        """
+        Initialize the SpeechToTextApplication.
 
-        base_models_dir = Path(models_dir) if models_dir is not None else Path(__file__).parent / "models"
-        self.export_dir = base_models_dir / "whisper_base_multilingual_onnx"
+        Args:
+            audio_records_path (Path | str | None): Path to the directory containing audio files.
+            models_dir (Path | str | None): Directory that contains the ONNX encoder/decoder
+                exported from WhisperBaseEn (`*_encoderinf.onnx` / `*_decoderinf.onnx`).
+        """
+        super().__init__(audio_records_path)
 
-        if not self.export_dir.exists():
-            raise FileNotFoundError(
-                f"Missing ONNX export folder:\n  {self.export_dir}\n\n"
-                f"Create it with:\n"
-                f"  optimum-cli export onnx --model openai/whisper-base "
-                f"--task automatic-speech-recognition --library transformers "
-                f"{self.export_dir}\n"
-            )
+        whisper_model, encoder_filename, decoder_filename = _load_qai_whisper_assets(model_name)
 
-        # Multilingual Whisper processor (tokenizer + feature extractor)
-        self.processor = WhisperProcessor.from_pretrained("openai/whisper-base")
-
-        # Force language for decoding (defaults to bg if not set)
-        self.lang = os.environ.get("WHISPER_LANG", "bg").strip().lower() or "bg"
-        self.task = os.environ.get("WHISPER_TASK", "transcribe").strip().lower() or "transcribe"
-        self.forced_decoder_ids = self.processor.get_decoder_prompt_ids(
-            language=self.lang,
-            task=self.task,
+        base_models_dir = (
+            Path(models_dir) if models_dir is not None else Path(__file__).parent / "models"
         )
+        encoder_path = base_models_dir / encoder_filename
+        decoder_path = base_models_dir / decoder_filename
 
-        # Load ONNX model (CPU)
-        # --- IMPORTANT ---
-        # If your export dir does NOT contain decoder_with_past_model.onnx, Optimum may error.
-        # We try explicit filenames first; if your Optimum version doesn't support these
-        # keyword args, it will throw TypeError. In that case you should use the manual
-        # ONNXRuntime decoding implementation (the other stt.py version).
-        try:
-            self.model = ORTModelForSpeechSeq2Seq.from_pretrained(
-                str(self.export_dir),
-                provider="CPUExecutionProvider",
-                encoder_file_name="encoder_model.onnx",
-                decoder_file_name="decoder_model.onnx",
-            )
-        except TypeError:
-            # Fallback: some Optimum versions only accept file_name for decoder
-            self.model = ORTModelForSpeechSeq2Seq.from_pretrained(
-                str(self.export_dir),
-                provider="CPUExecutionProvider",
-                file_name="decoder_model.onnx",
-            )
-
-        self.last_audio_file: Optional[Path] = None
-
-        print(f"[STT:CPU-ONNX] Export dir: {self.export_dir}")
-        print(f"[STT:CPU-ONNX] Forced language: {self.lang} task: {self.task}")
-
-    def _get_audio_file(self) -> Path:
-        if self.audio_records_path is None:
-            raise ValueError("Audio records path is not set.")
-        audio_files = list(self.audio_records_path.glob("*.wav"))
-        if not audio_files:
-            raise FileNotFoundError("No audio files found.")
-        # pick newest
-        audio_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        self.last_audio_file = audio_files[0]
-        return audio_files[0]
-
-    def _delete_audio_file(self) -> None:
-        if self.last_audio_file and self.last_audio_file.exists():
-            self.last_audio_file.unlink()
-            self.last_audio_file = None
-
-    @staticmethod
-    def _load_wav_mono_float32(wav_path: Path) -> tuple[np.ndarray, int]:
-        """
-        Load a PCM WAV file via the standard library and return (audio_float32, sample_rate).
-        Assumes 16-bit PCM (your recorder writes pyaudio.paInt16).
-        """
-        with wave.open(str(wav_path), "rb") as wf:
-            sr = wf.getframerate()
-            channels = wf.getnchannels()
-            sampwidth = wf.getsampwidth()
-            frames = wf.getnframes()
-            raw = wf.readframes(frames)
-
-        if sampwidth != 2:
-            raise ValueError(f"Expected 16-bit PCM WAV, got sampwidth={sampwidth} bytes.")
-
-        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-        if channels > 1:
-            audio = audio.reshape(-1, channels).mean(axis=1)
-        return audio, sr
-
-    @staticmethod
-    def _resample(audio: np.ndarray, src_sr: int, dst_sr: int = 16000) -> np.ndarray:
-        """
-        Prefer high-quality polyphase resampling if scipy is available.
-        Fall back to linear interpolation otherwise.
-        """
-        if src_sr == dst_sr:
-            return audio.astype(np.float32, copy=False)
-
-        try:
-            from scipy.signal import resample_poly
-            return resample_poly(audio, dst_sr, src_sr).astype(np.float32)
-        except Exception:
-            old_n = audio.shape[0]
-            new_n = int(round(old_n * (dst_sr / float(src_sr))))
-            if old_n == 0 or new_n == 0:
-                return np.zeros((0,), dtype=np.float32)
-            x_old = np.linspace(0.0, 1.0, num=old_n, endpoint=False)
-            x_new = np.linspace(0.0, 1.0, num=new_n, endpoint=False)
-            return np.interp(x_new, x_old, audio).astype(np.float32)
+        WhisperApp, OnnxModelTorchWrapper = _load_qai_whisper_runtime()
+        self.app = WhisperApp(
+            OnnxModelTorchWrapper.OnNPU(str(encoder_path)),
+            OnnxModelTorchWrapper.OnNPU(str(decoder_path)),
+            num_decoder_blocks=whisper_model.num_decoder_blocks,
+            num_decoder_heads=whisper_model.num_decoder_heads,
+            attention_dim=whisper_model.attention_dim,
+            mean_decode_len=whisper_model.mean_decode_len,
+        )
 
     def transcribe(self) -> str:
-        wav_path = self._get_audio_file()
+        """
+        Transcribe the first audio file in the records directory.
 
-        audio, sr = self._load_wav_mono_float32(wav_path)
-        audio_16k = self._resample(audio, sr, 16000)
+        Returns:
+            str: The transcription result.
 
-        # Prepare features
-        inputs = self.processor(audio_16k, sampling_rate=16000, return_tensors="pt")
-
-        # Generate transcription (force language/task)
-        generated_ids = self.model.generate(
-            inputs["input_features"],
-            forced_decoder_ids=self.forced_decoder_ids,
-            max_new_tokens=128,
-        )
-
-        text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-        print(f"Transcription result: {text}")
-
+        Raises:
+            ValueError: If audio_records_path is not set.
+            FileNotFoundError: If no audio files are found.
+        """
+        audio_file = self._get_audio_file()
+        transcription = self.app.transcribe(str(audio_file), audio_sample_rate=None)
+        print(f"Transcription result: {transcription}")
         self._delete_audio_file()
-        return text
+        return transcription
+
+
+class OpenAIWhisperSpeechToText(_AudioRecordMixin):
+    """Speech-to-text using the OpenAI Whisper open-source model."""
+
+    def __init__(
+        self,
+        audio_records_path: Path | str | None = None,
+        model_name: str = "base",
+        device: str | None = None,
+        language: str | None = None,
+        task: str = "transcribe",
+    ) -> None:
+        super().__init__(audio_records_path)
+        if not is_openai_whisper_available():
+            raise RuntimeError(
+                "openai-whisper is not installed. Install it with `pip install openai-whisper`."
+            )
+        import whisper
+
+        resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = whisper.load_model(model_name, device=resolved_device)
+        self.language = language
+        self.task = task
+
+    def transcribe(self) -> str:
+        audio_file = self._get_audio_file()
+        result = self.model.transcribe(
+            str(audio_file),
+            language=self.language,
+            task=self.task,
+        )
+        transcription = result.get("text", "").strip()
+        print(f"Transcription result: {transcription}")
+        self._delete_audio_file()
+        return transcription
+
+
+def is_whisper_base_available() -> bool:
+    """Return True if the multilingual whisper_base module can be imported."""
+    return (
+        importlib.util.find_spec("qai_hub_models.models.whisper_base") is not None
+        or importlib.util.find_spec("qai_hub_models.models.whisper_base.model") is not None
+    )
+
+
+def _load_whisper_base_model():
+    try:
+        whisper_base_module = importlib.import_module("qai_hub_models.models.whisper_base")
+    except ModuleNotFoundError as exc:
+        try:
+            whisper_base_module = importlib.import_module(
+                "qai_hub_models.models.whisper_base.model"
+            )
+        except ModuleNotFoundError as nested_exc:
+            raise RuntimeError(
+                "whisper_base is unavailable in the installed qai-hub-models package. "
+                "Please upgrade qai-hub-models or install a version that includes "
+                "qai_hub_models.models.whisper_base."
+            ) from nested_exc
+    model_cls = getattr(whisper_base_module, "Model", None) or getattr(
+        whisper_base_module, "WhisperBase", None
+    )
+    if model_cls is None:
+        raise RuntimeError(
+            "whisper_base model class not found. Expected Model or WhisperBase in "
+            "qai_hub_models.models.whisper_base."
+        )
+    return model_cls.from_pretrained()
+
+
+def is_openai_whisper_available() -> bool:
+    """Return True if the OpenAI Whisper package can be imported."""
+    return importlib.util.find_spec("whisper") is not None
+
+
+def _load_qai_whisper_runtime():
+    try:
+        from qai_hub_models.models._shared.whisper.app import WhisperApp
+        from qai_hub_models.utils.onnx_torch_wrapper import OnnxModelTorchWrapper
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "qai-hub-models is not installed. Install it with `pip install qai-hub-models` "
+            "to use the ONNX Whisper backend."
+        ) from exc
+    return WhisperApp, OnnxModelTorchWrapper
+
+
+def _load_qai_whisper_assets(model_name: str):
+    if model_name == "whisper_base_en":
+        try:
+            from qai_hub_models.models.whisper_base_en.model import WhisperBaseEn
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "qai-hub-models is not installed. Install it with `pip install qai-hub-models` "
+                "to use the ONNX Whisper backend."
+            ) from exc
+        model = WhisperBaseEn.from_pretrained()
+        encoder_filename = "whisper_base_en-whisperencoderinf.onnx"
+        decoder_filename = "whisper_base_en-whisperdecoderinf.onnx"
+    elif model_name == "whisper_base":
+        model = _load_whisper_base_model()
+        encoder_filename = "whisper_base-whisperencoderinf.onnx"
+        decoder_filename = "whisper_base-whisperdecoderinf.onnx"
+    else:
+        raise ValueError(
+            "Unsupported Whisper model name. Use 'whisper_base_en' or 'whisper_base'."
+        )
+    return model, encoder_filename, decoder_filename
