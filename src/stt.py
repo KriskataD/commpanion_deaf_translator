@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import importlib
+
 from qai_hub_models.models._shared.whisper.app import WhisperApp
 from qai_hub_models.models.whisper_base_en.model import WhisperBaseEn
 from qai_hub_models.utils.onnx_torch_wrapper import OnnxModelTorchWrapper
@@ -7,13 +9,14 @@ from qai_hub_models.utils.onnx_torch_wrapper import OnnxModelTorchWrapper
 
 class SpeechToTextApplication:
     """
-    Application for transcribing speech from audio files using WhisperBaseEn.
+    Application for transcribing speech from audio files using WhisperBase models.
     """
 
     def __init__(
         self,
         audio_records_path: Path | str | None = None,
         models_dir: Path | str | None = None,
+        model_name: str = "whisper_base_en",
     ) -> None:
         """
         Initialize the SpeechToTextApplication.
@@ -23,13 +26,27 @@ class SpeechToTextApplication:
             models_dir (Path | str | None): Directory that contains the ONNX encoder/decoder
                 exported from WhisperBaseEn (`*_encoderinf.onnx` / `*_decoderinf.onnx`).
         """
-        self.model = WhisperBaseEn.from_pretrained()
+        if model_name == "whisper_base_en":
+            self.model = WhisperBaseEn.from_pretrained()
+            encoder_filename = "whisper_base_en-whisperencoderinf.onnx"
+            decoder_filename = "whisper_base_en-whisperdecoderinf.onnx"
+        elif model_name == "whisper_base":
+            whisper_base_module = importlib.import_module(
+                "qai_hub_models.models.whisper_base.model"
+            )
+            self.model = whisper_base_module.WhisperBase.from_pretrained()
+            encoder_filename = "whisper_base-whisperencoderinf.onnx"
+            decoder_filename = "whisper_base-whisperdecoderinf.onnx"
+        else:
+            raise ValueError(
+                "Unsupported Whisper model name. Use 'whisper_base_en' or 'whisper_base'."
+            )
 
         base_models_dir = (
             Path(models_dir) if models_dir is not None else Path(__file__).parent / "models"
         )
-        encoder_path = base_models_dir / "whisper_base_en-whisperencoderinf.onnx"
-        decoder_path = base_models_dir / "whisper_base_en-whisperdecoderinf.onnx"
+        encoder_path = base_models_dir / encoder_filename
+        decoder_path = base_models_dir / decoder_filename
 
         self.app = WhisperApp(
             OnnxModelTorchWrapper.OnNPU(str(encoder_path)),
