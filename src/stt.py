@@ -161,21 +161,16 @@ def is_whisper_base_available() -> bool:
 
 def _load_whisper_base_model():
     try:
-
         whisper_base_module = importlib.import_module("qai_hub_models.models.whisper_base")
 
     except ModuleNotFoundError as exc:
-
         try:
-
             whisper_base_module = importlib.import_module(
 
                 "qai_hub_models.models.whisper_base.model"
-
             )
 
         except ModuleNotFoundError as nested_exc:
-
             raise RuntimeError(
 
                 "whisper_base is unavailable in the installed qai-hub-models package. "
@@ -183,7 +178,6 @@ def _load_whisper_base_model():
                 "Please upgrade qai-hub-models or install a version that includes "
 
                 "qai_hub_models.models.whisper_base."
-
             ) from nested_exc
 
     model_cls = getattr(whisper_base_module, "Model", None) or getattr(
