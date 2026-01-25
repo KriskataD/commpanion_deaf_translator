@@ -32,6 +32,7 @@ class WakeWordTranslationAssistant:
         speak: bool = True,
         prompt_user: bool = True,
         stay_awake: bool = False,
+        tts_timeout: float | None = None,
     ) -> None:
         WakeWordDetector.download_models()
 
@@ -43,9 +44,11 @@ class WakeWordTranslationAssistant:
             source_lang=source_lang,
             target_lang=target_lang,
             speak=speak,
+            tts_timeout=tts_timeout,
         )
         self.prompt_user = prompt_user
         self.stay_awake = stay_awake
+        self.tts_timeout = tts_timeout
         default_mic = self.translation.recorder.mic_selector.get_default_microphone()
         default_wake_device = default_mic["index"] if default_mic else None
         if wakeword_device_index is None and default_wake_device is not None:
@@ -94,11 +97,12 @@ class WakeWordTranslationAssistant:
         try:
             if self.prompt_user and self.translation.tts:
                 self.logger.info("Prompting user before recording.")
-                self.translation.tts.start(
+                prompt_text = (
                     "What can I do for you? Say translate to begin."
                     if not self.stay_awake
                     else "Ready. Say what you want translated. Say stop listening to finish."
                 )
+                self.translation.tts.start(prompt_text, timeout_s=self.tts_timeout)
                 self.logger.info("Prompt completed. Starting recording.")
 
             stop_phrases = {
@@ -121,7 +125,10 @@ class WakeWordTranslationAssistant:
                 prompt = self.translation.transcribe()
                 if not prompt or not prompt.strip():
                     if self.translation.tts:
-                        self.translation.tts.start("I did not catch that. Please try again.")
+                        self.translation.tts.start(
+                            "I did not catch that. Please try again.",
+                            timeout_s=self.tts_timeout,
+                        )
                     return
 
                 normalized = prompt.strip().lower()
@@ -129,12 +136,18 @@ class WakeWordTranslationAssistant:
 
                 if "sign language" in normalized or "signing" in normalized:
                     if self.translation.tts:
-                        self.translation.tts.start("Sign language detection pipeline is not ready yet.")
+                        self.translation.tts.start(
+                            "Sign language detection pipeline is not ready yet.",
+                            timeout_s=self.tts_timeout,
+                        )
                     return
 
                 if normalized in stop_phrases or "stop listening" in normalized:
                     if self.translation.tts:
-                        self.translation.tts.start("Stopping. Say the wake word when you need me again.")
+                        self.translation.tts.start(
+                            "Stopping. Say the wake word when you need me again.",
+                            timeout_s=self.tts_timeout,
+                        )
                     return
 
                 # Default path: translate from configured source->target languages.
@@ -144,7 +157,10 @@ class WakeWordTranslationAssistant:
                 if not self.stay_awake:
                     return
                 if self.prompt_user and self.translation.tts:
-                    self.translation.tts.start("Say another phrase or say stop listening to finish.")
+                    self.translation.tts.start(
+                        "Say another phrase or say stop listening to finish.",
+                        timeout_s=self.tts_timeout,
+                    )
         finally:
             self.detector.start()
 
@@ -220,6 +236,11 @@ def main() -> None:
         action="store_true",
         help="Keep listening for additional translations after a wake word until you say 'stop listening'.",
     )
+    parser.add_argument(
+        "--tts-timeout",
+        type=float,
+        help="Optional timeout (seconds) for TTS playback to avoid hangs.",
+    )
     args = parser.parse_args()
 
     assistant = WakeWordTranslationAssistant(
@@ -234,6 +255,7 @@ def main() -> None:
         speak=not args.no_speak,
         prompt_user=not args.no_prompt,
         stay_awake=args.stay_awake,
+        tts_timeout=args.tts_timeout,
     )
     assistant.run()
 

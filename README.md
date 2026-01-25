@@ -37,6 +37,7 @@ python -m src.wake_translation_assistant --source-lang en --target-lang fr
 - During capture the wake-word listener is paused to avoid microphone contention.
 - Use `--no-prompt` to skip the spoken prompt and `--no-speak` to disable spoken translations.
 - Use `--stay-awake` to keep translating without saying the wake word again (say "stop listening" to exit).
+- If TTS playback hangs, use `--no-speak` or set `--tts-timeout 5` to stop speech after a few seconds.
 
 For a translation-only loop without wake word you can also run:
 ```bash
