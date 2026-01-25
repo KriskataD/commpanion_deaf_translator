@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 
 import importlib.util
 
@@ -71,6 +72,11 @@ class SpeechToTextApplication:
             ValueError: If audio_records_path is not set.
             FileNotFoundError: If no audio files are found.
         """
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError(
+                "ffmpeg is required for Whisper transcription but was not found on PATH. "
+                "Install ffmpeg and ensure it is available in your system PATH."
+            )
         audio_file = self._get_audio_file()
         result = self.model.transcribe(
             str(audio_file),
