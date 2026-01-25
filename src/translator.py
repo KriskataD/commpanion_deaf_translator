@@ -59,6 +59,7 @@ class TranslatorPipeline:
         target_lang: str = "fr",
         speak: bool = True,
         stt_model: str | None = None,
+        tts_timeout: float | None = None,
     ) -> None:
         self.audio_dir = Path(audio_dir)
         self.audio_dir.mkdir(parents=True, exist_ok=True)
@@ -66,6 +67,7 @@ class TranslatorPipeline:
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.speak = speak
+        self.tts_timeout = tts_timeout
 
         self.recorder = AudioRecorder()
         if not is_openai_whisper_available():
@@ -120,7 +122,7 @@ class TranslatorPipeline:
     def translate_transcription(self, transcription: str) -> str:
         translated = self.translator.translate(transcription, self.source_lang, self.target_lang)
         if self.speak and translated and self.tts:
-            self.tts.start(translated)
+            self.tts.start(translated, timeout_s=self.tts_timeout)
         print(f"➡️  Translated ({self.source_lang} → {self.target_lang}): {translated}")
         return translated
 
@@ -129,7 +131,7 @@ class TranslatorPipeline:
 
         translated = self.translator.translate(text, self.source_lang, self.target_lang)
         if self.speak and translated and self.tts:
-            self.tts.start(translated)
+            self.tts.start(translated, timeout_s=self.tts_timeout)
         print(f"➡️  Translated text ({self.source_lang} → {self.target_lang}): {translated}")
         return translated
 
