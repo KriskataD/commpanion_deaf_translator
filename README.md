@@ -36,6 +36,7 @@ python -m src.wake_translation_assistant --source-lang en --target-lang fr
   `hey_jarvis` so detections still trigger.
 - During capture the wake-word listener is paused to avoid microphone contention.
 - Use `--no-prompt` to skip the spoken prompt and `--no-speak` to disable spoken translations.
+- Use `--stay-awake` to keep translating without saying the wake word again (say "stop listening" to exit).
 
 For a translation-only loop without wake word you can also run:
 ```bash

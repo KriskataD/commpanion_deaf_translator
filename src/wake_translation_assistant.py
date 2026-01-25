@@ -31,6 +31,7 @@ class WakeWordTranslationAssistant:
         wakeword_debug_interval: float = 1.0,
         speak: bool = True,
         prompt_user: bool = True,
+        stay_awake: bool = False,
     ) -> None:
         WakeWordDetector.download_models()
 
@@ -44,6 +45,7 @@ class WakeWordTranslationAssistant:
             speak=speak,
         )
         self.prompt_user = prompt_user
+        self.stay_awake = stay_awake
         default_mic = self.translation.recorder.mic_selector.get_default_microphone()
         default_wake_device = default_mic["index"] if default_mic else None
         if wakeword_device_index is None and default_wake_device is not None:
@@ -76,6 +78,8 @@ class WakeWordTranslationAssistant:
             self._is_processing = True
         try:
             fn()
+        except Exception:
+            self.logger.exception("Unhandled error while processing wake word request.")
         finally:
             with self._processing_lock:
                 self._is_processing = False
@@ -90,33 +94,57 @@ class WakeWordTranslationAssistant:
         try:
             if self.prompt_user and self.translation.tts:
                 self.logger.info("Prompting user before recording.")
-                self.translation.tts.start("What can I do for you? Say translate to begin.")
+                self.translation.tts.start(
+                    "What can I do for you? Say translate to begin."
+                    if not self.stay_awake
+                    else "Ready. Say what you want translated. Say stop listening to finish."
+                )
                 self.logger.info("Prompt completed. Starting recording.")
 
-            time.sleep(0.1)  # let the prompt finish before capturing audio
-            audio_path = self.translation.record(filename="last_rec.wav")
-            if audio_path:
-                self.logger.info("Wake word audio captured: %s", audio_path)
-            if not audio_path:
-                self.logger.warning("No audio captured after wake word.")
-                return
+            stop_phrases = {
+                "stop listening",
+                "stop",
+                "exit",
+                "quit",
+                "cancel",
+            }
+            while True:
+                time.sleep(0.1)  # let the prompt finish before capturing audio
+                audio_path = self.translation.record(filename="last_rec.wav")
+                if audio_path:
+                    self.logger.info("Wake word audio captured: %s", audio_path)
+                if not audio_path:
+                    self.logger.warning("No audio captured after wake word.")
+                    return
 
-            self.logger.info("Transcribing wake word audio...")
-            prompt = self.translation.transcribe()
-            if not prompt or not prompt.strip():
-                self.translation.tts.start("I did not catch that. Please try again.")
-                return
+                self.logger.info("Transcribing wake word audio...")
+                prompt = self.translation.transcribe()
+                if not prompt or not prompt.strip():
+                    if self.translation.tts:
+                        self.translation.tts.start("I did not catch that. Please try again.")
+                    return
 
-            normalized = prompt.strip().lower()
-            self.logger.info("Command captured: %s", normalized)
+                normalized = prompt.strip().lower()
+                self.logger.info("Command captured: %s", normalized)
 
-            if "sign language" in normalized or "signing" in normalized:
-                self.translation.tts.start("Sign language detection pipeline is not ready yet.")
-                return
+                if "sign language" in normalized or "signing" in normalized:
+                    if self.translation.tts:
+                        self.translation.tts.start("Sign language detection pipeline is not ready yet.")
+                    return
 
-            # Default path: translate from configured source->target languages.
-            self.logger.info("Translating wake word transcription...")
-            self.translation.translate_transcription(prompt)
+                if normalized in stop_phrases or "stop listening" in normalized:
+                    if self.translation.tts:
+                        self.translation.tts.start("Stopping. Say the wake word when you need me again.")
+                    return
+
+                # Default path: translate from configured source->target languages.
+                self.logger.info("Translating wake word transcription...")
+                self.translation.translate_transcription(prompt)
+
+                if not self.stay_awake:
+                    return
+                if self.prompt_user and self.translation.tts:
+                    self.translation.tts.start("Say another phrase or say stop listening to finish.")
         finally:
             self.detector.start()
 
@@ -187,6 +215,11 @@ def main() -> None:
         action="store_true",
         help="Skip the TTS prompt before recording after wake word detection.",
     )
+    parser.add_argument(
+        "--stay-awake",
+        action="store_true",
+        help="Keep listening for additional translations after a wake word until you say 'stop listening'.",
+    )
     args = parser.parse_args()
 
     assistant = WakeWordTranslationAssistant(
@@ -200,6 +233,7 @@ def main() -> None:
         wakeword_debug_interval=args.wake_debug_interval,
         speak=not args.no_speak,
         prompt_user=not args.no_prompt,
+        stay_awake=args.stay_awake,
     )
     assistant.run()
 
