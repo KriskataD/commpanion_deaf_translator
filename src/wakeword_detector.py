@@ -14,7 +14,7 @@ import logging
 class WakeWordDetector:
     """Modular wake word detector using openWakeWord."""
 
-    _MODEL_SUFFIX_RE = re.compile(r"_v\\d+(?:\\.\\d+)*$")
+    _MODEL_SUFFIX_RE = re.compile(r"_v\d+(?:\.\d+)*$")
     
     def __init__(
         self,
