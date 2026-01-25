@@ -13,6 +13,8 @@ sentencepiece
 
 # TTS
 pyttsx3
+pywin32
+comtypes
 
 # YOLOv8 + optional LM Studio helper
 ultralytics
