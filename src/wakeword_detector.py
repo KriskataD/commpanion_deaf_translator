@@ -219,7 +219,8 @@ class WakeWordDetector:
         
         # Wait for the thread to finish
         if hasattr(self, 'processing_thread'):
-            self.processing_thread.join()
+            if threading.current_thread() is not self.processing_thread:
+                self.processing_thread.join()
         
         # Close the stream
         if self.stream:
