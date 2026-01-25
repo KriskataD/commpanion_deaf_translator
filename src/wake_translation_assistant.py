@@ -83,28 +83,32 @@ class WakeWordTranslationAssistant:
 
     def _handle_request(self) -> None:
         """Capture user speech and route to translation (sign-language branch TBD)."""
-        self.translation.tts.start("What can I do for you? Say translate to begin.")
+        self.detector.stop()
+        try:
+            self.translation.tts.start("What can I do for you? Say translate to begin.")
 
-        time.sleep(0.1)  # let the prompt finish before capturing audio
-        audio_path = self.translation.record(filename="last_rec.wav")
-        if not audio_path:
-            self.logger.warning("No audio captured after wake word.")
-            return
+            time.sleep(0.1)  # let the prompt finish before capturing audio
+            audio_path = self.translation.record(filename="last_rec.wav")
+            if not audio_path:
+                self.logger.warning("No audio captured after wake word.")
+                return
 
-        prompt = self.translation.transcribe()
-        if not prompt or not prompt.strip():
-            self.translation.tts.start("I did not catch that. Please try again.")
-            return
+            prompt = self.translation.transcribe()
+            if not prompt or not prompt.strip():
+                self.translation.tts.start("I did not catch that. Please try again.")
+                return
 
-        normalized = prompt.strip().lower()
-        self.logger.info("Command captured: %s", normalized)
+            normalized = prompt.strip().lower()
+            self.logger.info("Command captured: %s", normalized)
 
-        if "sign language" in normalized or "signing" in normalized:
-            self.translation.tts.start("Sign language detection pipeline is not ready yet.")
-            return
+            if "sign language" in normalized or "signing" in normalized:
+                self.translation.tts.start("Sign language detection pipeline is not ready yet.")
+                return
 
-        # Default path: translate from configured source->target languages.
-        self.translation.translate_transcription(prompt)
+            # Default path: translate from configured source->target languages.
+            self.translation.translate_transcription(prompt)
+        finally:
+            self.detector.start()
 
     def run(self) -> None:
         """Start wake-word listening loop."""
