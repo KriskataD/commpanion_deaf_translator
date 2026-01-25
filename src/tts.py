@@ -22,6 +22,7 @@ class _TTS:
         """
         self._rate = rate
         self._initialize_engine()
+        self._lock = threading.Lock()
 
     def _initialize_engine(self) -> None:
         if os.name == "nt":
@@ -48,21 +49,22 @@ class _TTS:
             timeout_s (float | None): Optional timeout for speech playback in seconds.
         """
         print(f"🎤 Vocal synthesis: {text_}")
-        if timeout_s is not None:
-            self._initialize_engine()
-        self.engine.say(text_)
-        if timeout_s is None:
-            self.engine.runAndWait()
-            return
+        with self._lock:
+            if timeout_s is not None:
+                self._initialize_engine()
+            self.engine.say(text_)
+            if timeout_s is None:
+                self.engine.runAndWait()
+                return
 
-        thread = threading.Thread(target=self.engine.runAndWait)
-        thread.daemon = True
-        thread.start()
-        thread.join(timeout=timeout_s)
-        if thread.is_alive():
-            print(f"⚠️ TTS timeout after {timeout_s:.1f}s; stopping playback.")
-            self.engine.stop()
-        self._initialize_engine()
+            thread = threading.Thread(target=self.engine.runAndWait)
+            thread.daemon = True
+            thread.start()
+            thread.join(timeout=timeout_s)
+            if thread.is_alive():
+                print(f"⚠️ TTS timeout after {timeout_s:.1f}s; stopping playback.")
+                self.engine.stop()
+            self._initialize_engine()
 
 def _ensure_comtypes_cache() -> None:
     if os.environ.get("COMTYPES_GEN_DIR"):
