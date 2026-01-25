@@ -3,6 +3,7 @@ import re
 import threading
 import time
 from pathlib import Path
+from queue import Queue
 
 import pyttsx3
 
@@ -22,7 +23,9 @@ class _TTS:
         """
         self._rate = rate
         self._initialize_engine()
-        self._lock = threading.Lock()
+        self._queue: Queue[tuple[str, float | None, threading.Event]] = Queue()
+        self._worker_thread = threading.Thread(target=self._run_worker, daemon=True)
+        self._worker_thread.start()
 
     def _initialize_engine(self) -> None:
         if os.name == "nt":
@@ -49,22 +52,33 @@ class _TTS:
             timeout_s (float | None): Optional timeout for speech playback in seconds.
         """
         print(f"🎤 Vocal synthesis: {text_}")
-        with self._lock:
-            if timeout_s is not None:
-                self._initialize_engine()
-            self.engine.say(text_)
-            if timeout_s is None:
-                self.engine.runAndWait()
-                return
+        done = threading.Event()
+        self._queue.put((text_, timeout_s, done))
+        done.wait()
 
-            thread = threading.Thread(target=self.engine.runAndWait)
-            thread.daemon = True
-            thread.start()
-            thread.join(timeout=timeout_s)
-            if thread.is_alive():
-                print(f"⚠️ TTS timeout after {timeout_s:.1f}s; stopping playback.")
-                self.engine.stop()
-            self._initialize_engine()
+    def _run_worker(self) -> None:
+        while True:
+            text_, timeout_s, done = self._queue.get()
+            timer: threading.Timer | None = None
+            try:
+                if timeout_s is not None:
+                    self._initialize_engine()
+                    timer = threading.Timer(timeout_s, self._stop_engine_on_timeout, args=(timeout_s,))
+                    timer.start()
+                self.engine.say(text_)
+                self.engine.runAndWait()
+            except Exception:
+                self._initialize_engine()
+            finally:
+                if timer:
+                    timer.cancel()
+                if timeout_s is not None:
+                    self._initialize_engine()
+                done.set()
+
+    def _stop_engine_on_timeout(self, timeout_s: float) -> None:
+        print(f"⚠️ TTS timeout after {timeout_s:.1f}s; stopping playback.")
+        self.engine.stop()
 
 def _ensure_comtypes_cache() -> None:
     if os.environ.get("COMTYPES_GEN_DIR"):
