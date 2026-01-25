@@ -27,6 +27,9 @@ python -m src.wake_translation_assistant --source-lang en --target-lang fr
 - Say the wake word (default: `hey_jarvis`).  
 - After the prompt, speak the phrase to translate; translation is spoken back via TTS.  
 - Saying something about "sign language" will currently reply that the branch is not ready.
+- If wake word detection is not triggering, try specifying the input device index with
+  `--wake-mic-index` (see PyAudio device list on your system).
+- By default the wake word listener now uses the same default mic selected for recording.
 
 For a translation-only loop without wake word you can also run:
 ```bash

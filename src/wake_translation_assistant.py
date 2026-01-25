@@ -26,6 +26,7 @@ class WakeWordTranslationAssistant:
         target_lang: str = "fr",
         wakeword_models: list[str] | None = None,
         wakeword_threshold: float = 0.25,
+        wakeword_device_index: int | None = None,
     ) -> None:
         WakeWordDetector.download_models()
 
@@ -38,10 +39,18 @@ class WakeWordTranslationAssistant:
             target_lang=target_lang,
             speak=True,
         )
+        default_mic = self.translation.recorder.mic_selector.get_default_microphone()
+        default_wake_device = default_mic["index"] if default_mic else None
+        if wakeword_device_index is None and default_wake_device is not None:
+            self.logger.info(
+                "Using default microphone index %s for wake word detection.",
+                default_wake_device,
+            )
         self.wakeword_models = wakeword_models or ["hey_jarvis"]
         self.detector = WakeWordDetector(
             wakeword_models=self.wakeword_models,
             threshold=wakeword_threshold,
+            input_device_index=wakeword_device_index if wakeword_device_index is not None else default_wake_device,
         )
 
         # register callbacks for each wake word model name
@@ -133,6 +142,11 @@ def main() -> None:
         default=0.25,
         help="Detection threshold for wake word activation.",
     )
+    parser.add_argument(
+        "--wake-mic-index",
+        type=int,
+        help="PyAudio input device index to use for wake word detection.",
+    )
     args = parser.parse_args()
 
     assistant = WakeWordTranslationAssistant(
@@ -141,6 +155,7 @@ def main() -> None:
         target_lang=args.target_lang,
         wakeword_models=args.wakeword,
         wakeword_threshold=args.wake_threshold,
+        wakeword_device_index=args.wake_mic_index,
     )
     assistant.run()
 

@@ -19,6 +19,7 @@ class WakeWordDetector:
         chunk_size: int = 1280,
         sample_rate: int = 16000,
         channels: int = 1,
+        input_device_index: Optional[int] = None,
         logger: Optional[logging.Logger] = None
     ):
         """
@@ -38,6 +39,7 @@ class WakeWordDetector:
         self.chunk_size = chunk_size
         self.sample_rate = sample_rate
         self.channels = channels
+        self.input_device_index = input_device_index
         self.logger = logger or logging.getLogger(__name__)
         
         # Model initialization
@@ -55,6 +57,15 @@ class WakeWordDetector:
         self.is_listening = False
         self.audio_queue = queue.Queue()
         self.callbacks: Dict[str, Callable] = {}
+
+    def list_input_devices(self) -> list[dict[str, Any]]:
+        """Return available input devices from PyAudio."""
+        devices: list[dict[str, Any]] = []
+        for index in range(self.audio.get_device_count()):
+            info = self.audio.get_device_info_by_index(index)
+            if info.get("maxInputChannels", 0) > 0:
+                devices.append(info)
+        return devices
         
     def register_callback(self, wakeword: str, callback: Callable[[str, float], Any]):
         """
@@ -123,6 +134,14 @@ class WakeWordDetector:
         if self.is_listening:
             self.logger.warning("The detector is already running")
             return
+
+        if self.input_device_index is not None:
+            self.logger.info(
+                "Using wake word input device index: %s",
+                self.input_device_index,
+            )
+        else:
+            self.logger.info("Using default input device for wake word detection.")
         
         self.logger.info("Starting wake word detector")
         self.is_listening = True
@@ -134,7 +153,8 @@ class WakeWordDetector:
             rate=self.sample_rate,
             input=True,
             frames_per_buffer=self.chunk_size,
-            stream_callback=self._audio_callback
+            input_device_index=self.input_device_index,
+            stream_callback=self._audio_callback,
         )
         
         # Start the processing thread
