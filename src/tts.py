@@ -14,6 +14,13 @@ except ImportError:  # pragma: no cover - only needed on Windows
     pythoncom = None
     win32_client = None
 
+try:
+    import pythoncom
+    import win32com.client as win32_client
+except ImportError:  # pragma: no cover - only needed on Windows
+    pythoncom = None
+    win32_client = None
+
 CHUNK_REGEX = re.compile(r".*?[\.!?…](?:\s|$)")  # Regex to match complete sentence-like segments
 
 class _TTS:
@@ -21,12 +28,12 @@ class _TTS:
     A wrapper around the pyttsx3 engine to convert text to speech, used to vocalize complete sentences.
     """
 
-    def __init__(self, rate: int = 200):
+    def __init__(self, rate: int = 170):
         """
         Initialize the pyttsx3 text-to-speech engine.
 
         Args:
-            rate (int): Speed of speech in words per minute. Default is 200.
+            rate (int): Speed of speech in words per minute. Default is 170.
         """
         self._rate = rate
         self._use_sapi = os.name == "nt" and win32_client is not None and pythoncom is not None
