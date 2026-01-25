@@ -7,6 +7,13 @@ from queue import Queue
 
 import pyttsx3
 
+try:
+    import pythoncom
+    import win32com.client as win32_client
+except ImportError:  # pragma: no cover - only needed on Windows
+    pythoncom = None
+    win32_client = None
+
 CHUNK_REGEX = re.compile(r".*?[\.!?…](?:\s|$)")  # Regex to match complete sentence-like segments
 
 class _TTS:
@@ -14,15 +21,18 @@ class _TTS:
     A wrapper around the pyttsx3 engine to convert text to speech, used to vocalize complete sentences.
     """
 
-    def __init__(self, rate: int = 200):
+    def __init__(self, rate: int = 170):
         """
         Initialize the pyttsx3 text-to-speech engine.
 
         Args:
-            rate (int): Speed of speech in words per minute. Default is 200.
+            rate (int): Speed of speech in words per minute. Default is 170.
         """
         self._rate = rate
-        self._initialize_engine()
+        self._use_sapi = os.name == "nt" and win32_client is not None and pythoncom is not None
+        self._sapi_voice = None
+        if not self._use_sapi:
+            self._initialize_engine()
         self._queue: Queue[tuple[str, float | None, threading.Event]] = Queue()
         self._worker_thread = threading.Thread(target=self._run_worker, daemon=True)
         self._worker_thread.start()
@@ -56,27 +66,56 @@ class _TTS:
         self._queue.put((text_, timeout_s, done))
         done.wait()
 
+    def _get_sapi_voice(self):
+        if self._sapi_voice is None:
+            pythoncom.CoInitialize()
+            voice = win32_client.Dispatch("SAPI.SpVoice")
+            voice.Rate = self._rate
+            voice.Volume = 100
+            self._sapi_voice = voice
+        return self._sapi_voice
+
+    def _sapi_speak(self, text_: str, timeout_s: float | None) -> None:
+        voice = self._get_sapi_voice()
+        if timeout_s is None:
+            voice.Speak(text_)
+            return
+
+        flags_async = 1  # SpeechVoiceSpeakFlags.SVSFlagsAsync
+        flags_purge = 2  # SpeechVoiceSpeakFlags.SVSFPurgeBeforeSpeak
+        voice.Speak(text_, flags_async)
+        finished = voice.WaitUntilDone(int(timeout_s * 1000))
+        if finished:
+            return
+
+        print(f"⚠️ TTS timeout after {timeout_s:.1f}s; stopping playback.")
+        voice.Speak("", flags_async | flags_purge)
+
     def _run_worker(self) -> None:
         while True:
             text_, timeout_s, done = self._queue.get()
             try:
-                if timeout_s is not None:
-                    self._initialize_engine()
-                self.engine.say(text_)
-                playback = threading.Thread(target=self.engine.runAndWait)
-                playback.daemon = True
-                playback.start()
-                if timeout_s is not None:
-                    playback.join(timeout=timeout_s)
-                    if playback.is_alive():
-                        print(f"⚠️ TTS timeout after {timeout_s:.1f}s; stopping playback.")
-                        self.engine.stop()
+                if self._use_sapi:
+                    self._sapi_speak(text_, timeout_s)
                 else:
-                    playback.join()
+                    if timeout_s is not None:
+                        self._initialize_engine()
+                    self.engine.say(text_)
+                    playback = threading.Thread(target=self.engine.runAndWait)
+                    playback.daemon = True
+                    playback.start()
+                    if timeout_s is not None:
+                        playback.join(timeout=timeout_s)
+                        if playback.is_alive():
+                            print(f"⚠️ TTS timeout after {timeout_s:.1f}s; stopping playback.")
+                            self.engine.stop()
+                    else:
+                        playback.join()
             except Exception:
-                self._initialize_engine()
+                if not self._use_sapi:
+                    self._initialize_engine()
             finally:
-                if timeout_s is not None:
+                if timeout_s is not None and not self._use_sapi:
                     self._initialize_engine()
                 done.set()
 

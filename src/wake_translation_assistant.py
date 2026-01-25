@@ -24,6 +24,7 @@ class WakeWordTranslationAssistant:
         audio_dir: Path | str = "audio",
         source_lang: str = "en",
         target_lang: str = "fr",
+        stt_model: str | None = None,
         wakeword_models: list[str] | None = None,
         wakeword_threshold: float = 0.25,
         wakeword_device_index: int | None = None,
@@ -44,6 +45,7 @@ class WakeWordTranslationAssistant:
             source_lang=source_lang,
             target_lang=target_lang,
             speak=speak,
+            stt_model=stt_model,
             tts_timeout=tts_timeout,
         )
         self.prompt_user = prompt_user
@@ -196,6 +198,13 @@ def main() -> None:
         help="Directory where microphone captures are stored.",
     )
     parser.add_argument(
+        "--stt-model",
+        help=(
+            "Whisper STT model to use. Supported values: openai_whisper[:model] "
+            "(e.g., openai_whisper:small). Defaults to openai_whisper:base."
+        ),
+    )
+    parser.add_argument(
         "--wakeword",
         action="append",
         help="Wake word model(s) to load (defaults to openWakeWord's hey_jarvis).",
@@ -248,6 +257,7 @@ def main() -> None:
         audio_dir=args.audio_dir,
         source_lang=args.source_lang,
         target_lang=args.target_lang,
+        stt_model=args.stt_model,
         wakeword_models=args.wakeword,
         wakeword_threshold=args.wake_threshold,
         wakeword_device_index=args.wake_mic_index,
