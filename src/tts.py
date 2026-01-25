@@ -1,7 +1,9 @@
 import os
 import re
+import threading
 import time
 from pathlib import Path
+from queue import Queue
 
 import pyttsx3
 
@@ -19,6 +21,13 @@ class _TTS:
         Args:
             rate (int): Speed of speech in words per minute. Default is 200.
         """
+        self._rate = rate
+        self._initialize_engine()
+        self._queue: Queue[tuple[str, float | None, threading.Event]] = Queue()
+        self._worker_thread = threading.Thread(target=self._run_worker, daemon=True)
+        self._worker_thread.start()
+
+    def _initialize_engine(self) -> None:
         if os.name == "nt":
             _ensure_comtypes_cache()
 
@@ -31,19 +40,45 @@ class _TTS:
                 "writable. Try reinstalling with `pip install --upgrade comtypes pywin32`."
             ) from exc
 
-        self.engine.setProperty("rate", rate)
+        self.engine.setProperty("rate", self._rate)
 
 
-    def start(self, text_: str):
+    def start(self, text_: str, timeout_s: float | None = None):
         """
         Speak the given text out loud.
 
         Args:
             text_ (str): The sentence or phrase to be vocalized.
+            timeout_s (float | None): Optional timeout for speech playback in seconds.
         """
         print(f"🎤 Vocal synthesis: {text_}")
-        self.engine.say(text_)
-        self.engine.runAndWait()
+        done = threading.Event()
+        self._queue.put((text_, timeout_s, done))
+        done.wait()
+
+    def _run_worker(self) -> None:
+        while True:
+            text_, timeout_s, done = self._queue.get()
+            try:
+                if timeout_s is not None:
+                    self._initialize_engine()
+                self.engine.say(text_)
+                playback = threading.Thread(target=self.engine.runAndWait)
+                playback.daemon = True
+                playback.start()
+                if timeout_s is not None:
+                    playback.join(timeout=timeout_s)
+                    if playback.is_alive():
+                        print(f"⚠️ TTS timeout after {timeout_s:.1f}s; stopping playback.")
+                        self.engine.stop()
+                else:
+                    playback.join()
+            except Exception:
+                self._initialize_engine()
+            finally:
+                if timeout_s is not None:
+                    self._initialize_engine()
+                done.set()
 
 def _ensure_comtypes_cache() -> None:
     if os.environ.get("COMTYPES_GEN_DIR"):
