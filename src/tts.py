@@ -21,6 +21,13 @@ except ImportError:  # pragma: no cover - only needed on Windows
     pythoncom = None
     win32_client = None
 
+try:
+    import pythoncom
+    import win32com.client as win32_client
+except ImportError:  # pragma: no cover - only needed on Windows
+    pythoncom = None
+    win32_client = None
+
 CHUNK_REGEX = re.compile(r".*?[\.!?…](?:\s|$)")  # Regex to match complete sentence-like segments
 
 class _TTS:
