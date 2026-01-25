@@ -132,6 +132,7 @@ class WakeWordTranslationAssistant:
                     return
 
                 normalized = prompt.strip().lower()
+                print(f"📝 Transcription result: {prompt}")
                 self.logger.info("Command captured: %s", normalized)
 
                 if "sign language" in normalized or "signing" in normalized:
