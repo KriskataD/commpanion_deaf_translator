@@ -59,26 +59,26 @@ class _TTS:
     def _run_worker(self) -> None:
         while True:
             text_, timeout_s, done = self._queue.get()
-            timer: threading.Timer | None = None
             try:
                 if timeout_s is not None:
                     self._initialize_engine()
-                    timer = threading.Timer(timeout_s, self._stop_engine_on_timeout, args=(timeout_s,))
-                    timer.start()
                 self.engine.say(text_)
-                self.engine.runAndWait()
+                playback = threading.Thread(target=self.engine.runAndWait)
+                playback.daemon = True
+                playback.start()
+                if timeout_s is not None:
+                    playback.join(timeout=timeout_s)
+                    if playback.is_alive():
+                        print(f"⚠️ TTS timeout after {timeout_s:.1f}s; stopping playback.")
+                        self.engine.stop()
+                else:
+                    playback.join()
             except Exception:
                 self._initialize_engine()
             finally:
-                if timer:
-                    timer.cancel()
                 if timeout_s is not None:
                     self._initialize_engine()
                 done.set()
-
-    def _stop_engine_on_timeout(self, timeout_s: float) -> None:
-        print(f"⚠️ TTS timeout after {timeout_s:.1f}s; stopping playback.")
-        self.engine.stop()
 
 def _ensure_comtypes_cache() -> None:
     if os.environ.get("COMTYPES_GEN_DIR"):
