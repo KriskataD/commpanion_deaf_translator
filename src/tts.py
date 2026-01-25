@@ -28,7 +28,7 @@ class _TTS:
     A wrapper around the pyttsx3 engine to convert text to speech, used to vocalize complete sentences.
     """
 
-    def __init__(self, rate: int = 170):
+    def __init__(self, rate: int = 1):
         """
         Initialize the pyttsx3 text-to-speech engine.
 
