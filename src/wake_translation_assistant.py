@@ -205,13 +205,6 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--stt-model",
-        help=(
-            "Whisper STT model to use. Supported values: openai_whisper[:model] "
-            "(e.g., openai_whisper:small). Defaults to openai_whisper:base."
-        ),
-    )
-    parser.add_argument(
         "--wakeword",
         action="append",
         help="Wake word model(s) to load (defaults to openWakeWord's hey_jarvis).",
