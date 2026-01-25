@@ -89,10 +89,13 @@ class WakeWordTranslationAssistant:
 
             time.sleep(0.1)  # let the prompt finish before capturing audio
             audio_path = self.translation.record(filename="last_rec.wav")
+            if audio_path:
+                self.logger.info("Wake word audio captured: %s", audio_path)
             if not audio_path:
                 self.logger.warning("No audio captured after wake word.")
                 return
 
+            self.logger.info("Transcribing wake word audio...")
             prompt = self.translation.transcribe()
             if not prompt or not prompt.strip():
                 self.translation.tts.start("I did not catch that. Please try again.")
@@ -106,6 +109,7 @@ class WakeWordTranslationAssistant:
                 return
 
             # Default path: translate from configured source->target languages.
+            self.logger.info("Translating wake word transcription...")
             self.translation.translate_transcription(prompt)
         finally:
             self.detector.start()
