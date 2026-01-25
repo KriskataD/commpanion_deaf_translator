@@ -1,5 +1,6 @@
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -19,6 +20,11 @@ class _TTS:
         Args:
             rate (int): Speed of speech in words per minute. Default is 200.
         """
+        self._rate = rate
+        self._initialize_engine()
+        self._lock = threading.Lock()
+
+    def _initialize_engine(self) -> None:
         if os.name == "nt":
             _ensure_comtypes_cache()
 
@@ -31,19 +37,34 @@ class _TTS:
                 "writable. Try reinstalling with `pip install --upgrade comtypes pywin32`."
             ) from exc
 
-        self.engine.setProperty("rate", rate)
+        self.engine.setProperty("rate", self._rate)
 
 
-    def start(self, text_: str):
+    def start(self, text_: str, timeout_s: float | None = None):
         """
         Speak the given text out loud.
 
         Args:
             text_ (str): The sentence or phrase to be vocalized.
+            timeout_s (float | None): Optional timeout for speech playback in seconds.
         """
         print(f"🎤 Vocal synthesis: {text_}")
-        self.engine.say(text_)
-        self.engine.runAndWait()
+        with self._lock:
+            if timeout_s is not None:
+                self._initialize_engine()
+            self.engine.say(text_)
+            if timeout_s is None:
+                self.engine.runAndWait()
+                return
+
+            thread = threading.Thread(target=self.engine.runAndWait)
+            thread.daemon = True
+            thread.start()
+            thread.join(timeout=timeout_s)
+            if thread.is_alive():
+                print(f"⚠️ TTS timeout after {timeout_s:.1f}s; stopping playback.")
+                self.engine.stop()
+            self._initialize_engine()
 
 def _ensure_comtypes_cache() -> None:
     if os.environ.get("COMTYPES_GEN_DIR"):
