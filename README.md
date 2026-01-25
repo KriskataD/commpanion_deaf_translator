@@ -32,6 +32,8 @@ python -m src.wake_translation_assistant --source-lang en --target-lang fr
 - By default the wake word listener now uses the same default mic selected for recording.
 - To debug detection, add `--wake-debug` to log the top wake word score every second and
   verify that audio is reaching the model (adjust `--wake-debug-interval` as needed).
+- If you pass a model path (e.g., `hey_jarvis_v0.1.onnx`), callbacks are normalized to
+  `hey_jarvis` so detections still trigger.
 
 For a translation-only loop without wake word you can also run:
 ```bash

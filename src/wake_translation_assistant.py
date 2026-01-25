@@ -125,6 +125,7 @@ class WakeWordTranslationAssistant:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(
         description="Wake-word controlled speech translator (wake word -> STT -> translate -> TTS)."
     )

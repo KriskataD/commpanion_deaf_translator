@@ -5,12 +5,16 @@ from openwakeword.utils import download_models
 import threading
 import queue
 import os
+import re
+from pathlib import Path
 import time
 from typing import Callable, Optional, Dict, Any
 import logging
 
 class WakeWordDetector:
     """Modular wake word detector using openWakeWord."""
+
+    _MODEL_SUFFIX_RE = re.compile(r"_v\\d+(?:\\.\\d+)*$")
     
     def __init__(
         self,
@@ -81,8 +85,22 @@ class WakeWordDetector:
             wakeword: Wake word name
             callback: Function to call (receives the detected word and the score)
         """
-        self.callbacks[wakeword] = callback
-        self.logger.info(f"Callback registered for '{wakeword}'")
+        normalized = self._normalize_wakeword_name(wakeword)
+        self.callbacks[normalized] = callback
+        if normalized != wakeword:
+            self.callbacks[wakeword] = callback
+            self.logger.info(
+                "Callback registered for '%s' (normalized from '%s')",
+                normalized,
+                wakeword,
+            )
+        else:
+            self.logger.info("Callback registered for '%s'", wakeword)
+
+    def _normalize_wakeword_name(self, wakeword: str) -> str:
+        """Normalize wake word names to match openWakeWord prediction keys."""
+        stem = Path(wakeword).stem
+        return self._MODEL_SUFFIX_RE.sub("", stem)
         
     def _audio_callback(self, in_data, frame_count, time_info, status):
         """Callback for the audio stream."""
@@ -119,10 +137,20 @@ class WakeWordDetector:
                 
                 # Check detections
                 for wakeword, score in predictions.items():
+                    normalized = self._normalize_wakeword_name(wakeword)
                     if score > self.threshold:
-                        self.logger.info(f"Wake word detected: {wakeword} (score: {score:.2f})")
+                        self.logger.info(
+                            "Wake word detected: %s (score: %.2f)",
+                            normalized,
+                            score,
+                        )
                         # Call the callback if available
-                        if wakeword in self.callbacks:
+                        if normalized in self.callbacks:
+                            try:
+                                self.callbacks[normalized](normalized, score)
+                            except Exception as e:
+                                self.logger.error(f"Error in callback: {e}")
+                        elif wakeword in self.callbacks:
                             try:
                                 self.callbacks[wakeword](wakeword, score)
                             except Exception as e:
