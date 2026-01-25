@@ -5,6 +5,7 @@ from openwakeword.utils import download_models
 import threading
 import queue
 import os
+import time
 from typing import Callable, Optional, Dict, Any
 import logging
 
@@ -19,6 +20,9 @@ class WakeWordDetector:
         chunk_size: int = 1280,
         sample_rate: int = 16000,
         channels: int = 1,
+        input_device_index: Optional[int] = None,
+        log_predictions: bool = False,
+        log_interval_s: float = 1.0,
         logger: Optional[logging.Logger] = None
     ):
         """
@@ -38,6 +42,9 @@ class WakeWordDetector:
         self.chunk_size = chunk_size
         self.sample_rate = sample_rate
         self.channels = channels
+        self.input_device_index = input_device_index
+        self.log_predictions = log_predictions
+        self.log_interval_s = log_interval_s
         self.logger = logger or logging.getLogger(__name__)
         
         # Model initialization
@@ -55,6 +62,16 @@ class WakeWordDetector:
         self.is_listening = False
         self.audio_queue = queue.Queue()
         self.callbacks: Dict[str, Callable] = {}
+        self._last_log_time = time.monotonic()
+
+    def list_input_devices(self) -> list[dict[str, Any]]:
+        """Return available input devices from PyAudio."""
+        devices: list[dict[str, Any]] = []
+        for index in range(self.audio.get_device_count()):
+            info = self.audio.get_device_info_by_index(index)
+            if info.get("maxInputChannels", 0) > 0:
+                devices.append(info)
+        return devices
         
     def register_callback(self, wakeword: str, callback: Callable[[str, float], Any]):
         """
@@ -87,6 +104,18 @@ class WakeWordDetector:
                 
                 # Prediction
                 predictions = self.model.predict(audio_array)
+
+                if self.log_predictions:
+                    now = time.monotonic()
+                    if now - self._last_log_time >= self.log_interval_s:
+                        best = max(predictions.items(), key=lambda item: item[1], default=None)
+                        if best:
+                            self.logger.info(
+                                "Wake word scores (top): %s=%.3f",
+                                best[0],
+                                best[1],
+                            )
+                        self._last_log_time = now
                 
                 # Check detections
                 for wakeword, score in predictions.items():
@@ -123,6 +152,14 @@ class WakeWordDetector:
         if self.is_listening:
             self.logger.warning("The detector is already running")
             return
+
+        if self.input_device_index is not None:
+            self.logger.info(
+                "Using wake word input device index: %s",
+                self.input_device_index,
+            )
+        else:
+            self.logger.info("Using default input device for wake word detection.")
         
         self.logger.info("Starting wake word detector")
         self.is_listening = True
@@ -134,7 +171,8 @@ class WakeWordDetector:
             rate=self.sample_rate,
             input=True,
             frames_per_buffer=self.chunk_size,
-            stream_callback=self._audio_callback
+            input_device_index=self.input_device_index,
+            stream_callback=self._audio_callback,
         )
         
         # Start the processing thread
