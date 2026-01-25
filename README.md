@@ -27,6 +27,16 @@ python -m src.wake_translation_assistant --source-lang en --target-lang fr
 - Say the wake word (default: `hey_jarvis`).  
 - After the prompt, speak the phrase to translate; translation is spoken back via TTS.  
 - Saying something about "sign language" will currently reply that the branch is not ready.
+- If wake word detection is not triggering, try specifying the input device index with
+  `--wake-mic-index` (see PyAudio device list on your system).
+- By default the wake word listener now uses the same default mic selected for recording.
+- To debug detection, add `--wake-debug` to log the top wake word score every second and
+  verify that audio is reaching the model (adjust `--wake-debug-interval` as needed).
+- If you pass a model path (e.g., `hey_jarvis_v0.1.onnx`), callbacks are normalized to
+  `hey_jarvis` so detections still trigger.
+- During capture the wake-word listener is paused to avoid microphone contention.
+- Use `--no-prompt` to skip the spoken prompt and `--no-speak` to disable spoken translations.
+- Use `--stay-awake` to keep translating without saying the wake word again (say "stop listening" to exit).
 
 For a translation-only loop without wake word you can also run:
 ```bash
