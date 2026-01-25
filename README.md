@@ -35,6 +35,7 @@ python -m src.wake_translation_assistant --source-lang en --target-lang fr
 - If you pass a model path (e.g., `hey_jarvis_v0.1.onnx`), callbacks are normalized to
   `hey_jarvis` so detections still trigger.
 - During capture the wake-word listener is paused to avoid microphone contention.
+- Use `--no-prompt` to skip the spoken prompt and `--no-speak` to disable spoken translations.
 
 For a translation-only loop without wake word you can also run:
 ```bash

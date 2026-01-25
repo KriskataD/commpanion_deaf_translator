@@ -29,6 +29,8 @@ class WakeWordTranslationAssistant:
         wakeword_device_index: int | None = None,
         wakeword_debug: bool = False,
         wakeword_debug_interval: float = 1.0,
+        speak: bool = True,
+        prompt_user: bool = True,
     ) -> None:
         WakeWordDetector.download_models()
 
@@ -39,8 +41,9 @@ class WakeWordTranslationAssistant:
             audio_dir=audio_dir,
             source_lang=source_lang,
             target_lang=target_lang,
-            speak=True,
+            speak=speak,
         )
+        self.prompt_user = prompt_user
         default_mic = self.translation.recorder.mic_selector.get_default_microphone()
         default_wake_device = default_mic["index"] if default_mic else None
         if wakeword_device_index is None and default_wake_device is not None:
@@ -85,7 +88,10 @@ class WakeWordTranslationAssistant:
         """Capture user speech and route to translation (sign-language branch TBD)."""
         self.detector.stop()
         try:
-            self.translation.tts.start("What can I do for you? Say translate to begin.")
+            if self.prompt_user and self.translation.tts:
+                self.logger.info("Prompting user before recording.")
+                self.translation.tts.start("What can I do for you? Say translate to begin.")
+                self.logger.info("Prompt completed. Starting recording.")
 
             time.sleep(0.1)  # let the prompt finish before capturing audio
             audio_path = self.translation.record(filename="last_rec.wav")
@@ -171,6 +177,16 @@ def main() -> None:
         default=1.0,
         help="Seconds between wake word score logs when --wake-debug is enabled.",
     )
+    parser.add_argument(
+        "--no-speak",
+        action="store_true",
+        help="Disable TTS playback of translations.",
+    )
+    parser.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Skip the TTS prompt before recording after wake word detection.",
+    )
     args = parser.parse_args()
 
     assistant = WakeWordTranslationAssistant(
@@ -182,6 +198,8 @@ def main() -> None:
         wakeword_device_index=args.wake_mic_index,
         wakeword_debug=args.wake_debug,
         wakeword_debug_interval=args.wake_debug_interval,
+        speak=not args.no_speak,
+        prompt_user=not args.no_prompt,
     )
     assistant.run()
 
