@@ -26,6 +26,9 @@ class WakeWordTranslationAssistant:
         target_lang: str = "fr",
         wakeword_models: list[str] | None = None,
         wakeword_threshold: float = 0.25,
+        wakeword_device_index: int | None = None,
+        wakeword_debug: bool = False,
+        wakeword_debug_interval: float = 1.0,
     ) -> None:
         WakeWordDetector.download_models()
 
@@ -38,10 +41,20 @@ class WakeWordTranslationAssistant:
             target_lang=target_lang,
             speak=True,
         )
+        default_mic = self.translation.recorder.mic_selector.get_default_microphone()
+        default_wake_device = default_mic["index"] if default_mic else None
+        if wakeword_device_index is None and default_wake_device is not None:
+            self.logger.info(
+                "Using default microphone index %s for wake word detection.",
+                default_wake_device,
+            )
         self.wakeword_models = wakeword_models or ["hey_jarvis"]
         self.detector = WakeWordDetector(
             wakeword_models=self.wakeword_models,
             threshold=wakeword_threshold,
+            input_device_index=wakeword_device_index if wakeword_device_index is not None else default_wake_device,
+            log_predictions=wakeword_debug,
+            log_interval_s=wakeword_debug_interval,
         )
 
         # register callbacks for each wake word model name
@@ -70,28 +83,36 @@ class WakeWordTranslationAssistant:
 
     def _handle_request(self) -> None:
         """Capture user speech and route to translation (sign-language branch TBD)."""
-        self.translation.tts.start("What can I do for you? Say translate to begin.")
+        self.detector.stop()
+        try:
+            self.translation.tts.start("What can I do for you? Say translate to begin.")
 
-        time.sleep(0.1)  # let the prompt finish before capturing audio
-        audio_path = self.translation.record(filename="last_rec.wav")
-        if not audio_path:
-            self.logger.warning("No audio captured after wake word.")
-            return
+            time.sleep(0.1)  # let the prompt finish before capturing audio
+            audio_path = self.translation.record(filename="last_rec.wav")
+            if audio_path:
+                self.logger.info("Wake word audio captured: %s", audio_path)
+            if not audio_path:
+                self.logger.warning("No audio captured after wake word.")
+                return
 
-        prompt = self.translation.transcribe()
-        if not prompt or not prompt.strip():
-            self.translation.tts.start("I did not catch that. Please try again.")
-            return
+            self.logger.info("Transcribing wake word audio...")
+            prompt = self.translation.transcribe()
+            if not prompt or not prompt.strip():
+                self.translation.tts.start("I did not catch that. Please try again.")
+                return
 
-        normalized = prompt.strip().lower()
-        self.logger.info("Command captured: %s", normalized)
+            normalized = prompt.strip().lower()
+            self.logger.info("Command captured: %s", normalized)
 
-        if "sign language" in normalized or "signing" in normalized:
-            self.translation.tts.start("Sign language detection pipeline is not ready yet.")
-            return
+            if "sign language" in normalized or "signing" in normalized:
+                self.translation.tts.start("Sign language detection pipeline is not ready yet.")
+                return
 
-        # Default path: translate from configured source->target languages.
-        self.translation.translate_transcription(prompt)
+            # Default path: translate from configured source->target languages.
+            self.logger.info("Translating wake word transcription...")
+            self.translation.translate_transcription(prompt)
+        finally:
+            self.detector.start()
 
     def run(self) -> None:
         """Start wake-word listening loop."""
@@ -112,6 +133,7 @@ class WakeWordTranslationAssistant:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(
         description="Wake-word controlled speech translator (wake word -> STT -> translate -> TTS)."
     )
@@ -133,6 +155,22 @@ def main() -> None:
         default=0.25,
         help="Detection threshold for wake word activation.",
     )
+    parser.add_argument(
+        "--wake-mic-index",
+        type=int,
+        help="PyAudio input device index to use for wake word detection.",
+    )
+    parser.add_argument(
+        "--wake-debug",
+        action="store_true",
+        help="Log wake word scores periodically for debugging.",
+    )
+    parser.add_argument(
+        "--wake-debug-interval",
+        type=float,
+        default=1.0,
+        help="Seconds between wake word score logs when --wake-debug is enabled.",
+    )
     args = parser.parse_args()
 
     assistant = WakeWordTranslationAssistant(
@@ -141,6 +179,9 @@ def main() -> None:
         target_lang=args.target_lang,
         wakeword_models=args.wakeword,
         wakeword_threshold=args.wake_threshold,
+        wakeword_device_index=args.wake_mic_index,
+        wakeword_debug=args.wake_debug,
+        wakeword_debug_interval=args.wake_debug_interval,
     )
     assistant.run()
 
