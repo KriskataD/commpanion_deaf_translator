@@ -30,6 +30,8 @@ python -m src.wake_translation_assistant --source-lang en --target-lang fr
 - If wake word detection is not triggering, try specifying the input device index with
   `--wake-mic-index` (see PyAudio device list on your system).
 - By default the wake word listener now uses the same default mic selected for recording.
+- To debug detection, add `--wake-debug` to log the top wake word score every second and
+  verify that audio is reaching the model (adjust `--wake-debug-interval` as needed).
 
 For a translation-only loop without wake word you can also run:
 ```bash

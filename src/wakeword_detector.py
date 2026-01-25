@@ -5,6 +5,7 @@ from openwakeword.utils import download_models
 import threading
 import queue
 import os
+import time
 from typing import Callable, Optional, Dict, Any
 import logging
 
@@ -20,6 +21,8 @@ class WakeWordDetector:
         sample_rate: int = 16000,
         channels: int = 1,
         input_device_index: Optional[int] = None,
+        log_predictions: bool = False,
+        log_interval_s: float = 1.0,
         logger: Optional[logging.Logger] = None
     ):
         """
@@ -40,6 +43,8 @@ class WakeWordDetector:
         self.sample_rate = sample_rate
         self.channels = channels
         self.input_device_index = input_device_index
+        self.log_predictions = log_predictions
+        self.log_interval_s = log_interval_s
         self.logger = logger or logging.getLogger(__name__)
         
         # Model initialization
@@ -57,6 +62,7 @@ class WakeWordDetector:
         self.is_listening = False
         self.audio_queue = queue.Queue()
         self.callbacks: Dict[str, Callable] = {}
+        self._last_log_time = time.monotonic()
 
     def list_input_devices(self) -> list[dict[str, Any]]:
         """Return available input devices from PyAudio."""
@@ -98,6 +104,18 @@ class WakeWordDetector:
                 
                 # Prediction
                 predictions = self.model.predict(audio_array)
+
+                if self.log_predictions:
+                    now = time.monotonic()
+                    if now - self._last_log_time >= self.log_interval_s:
+                        best = max(predictions.items(), key=lambda item: item[1], default=None)
+                        if best:
+                            self.logger.info(
+                                "Wake word scores (top): %s=%.3f",
+                                best[0],
+                                best[1],
+                            )
+                        self._last_log_time = now
                 
                 # Check detections
                 for wakeword, score in predictions.items():

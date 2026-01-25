@@ -27,6 +27,8 @@ class WakeWordTranslationAssistant:
         wakeword_models: list[str] | None = None,
         wakeword_threshold: float = 0.25,
         wakeword_device_index: int | None = None,
+        wakeword_debug: bool = False,
+        wakeword_debug_interval: float = 1.0,
     ) -> None:
         WakeWordDetector.download_models()
 
@@ -51,6 +53,8 @@ class WakeWordTranslationAssistant:
             wakeword_models=self.wakeword_models,
             threshold=wakeword_threshold,
             input_device_index=wakeword_device_index if wakeword_device_index is not None else default_wake_device,
+            log_predictions=wakeword_debug,
+            log_interval_s=wakeword_debug_interval,
         )
 
         # register callbacks for each wake word model name
@@ -147,6 +151,17 @@ def main() -> None:
         type=int,
         help="PyAudio input device index to use for wake word detection.",
     )
+    parser.add_argument(
+        "--wake-debug",
+        action="store_true",
+        help="Log wake word scores periodically for debugging.",
+    )
+    parser.add_argument(
+        "--wake-debug-interval",
+        type=float,
+        default=1.0,
+        help="Seconds between wake word score logs when --wake-debug is enabled.",
+    )
     args = parser.parse_args()
 
     assistant = WakeWordTranslationAssistant(
@@ -156,6 +171,8 @@ def main() -> None:
         wakeword_models=args.wakeword,
         wakeword_threshold=args.wake_threshold,
         wakeword_device_index=args.wake_mic_index,
+        wakeword_debug=args.wake_debug,
+        wakeword_debug_interval=args.wake_debug_interval,
     )
     assistant.run()
 
