@@ -98,7 +98,7 @@ class WakeWordTranslationAssistant:
             return "detect"
         return None
 
-    def _handle_translate_mode(self) -> None:
+    def _handle_translate_mode(self) -> str | None:
         if self.translation.tts:
             self.translation.tts.start(
                 "Ready to translate. Please say what you want translated.",
@@ -115,7 +115,7 @@ class WakeWordTranslationAssistant:
                     "I did not catch anything to translate. Please try again.",
                     timeout_s=self.tts_timeout,
                 )
-            return
+            return None
 
         self.logger.info("Transcribing translation audio...")
         transcription = self.translation.transcribe(delete=self.translation.source_lang == "en")
@@ -127,10 +127,32 @@ class WakeWordTranslationAssistant:
                     "I did not catch that. Please try again.",
                     timeout_s=self.tts_timeout,
                 )
-            return
+            return None
+
+        stop_intent = self._get_stop_intent(transcription)
+        if self.translation.source_lang != "en":
+            english_transcription = self.translation.transcribe(language_override="en", delete=True)
+            english_stop_intent = self._get_stop_intent(english_transcription)
+            if english_stop_intent:
+                stop_intent = english_stop_intent
+
+        if stop_intent:
+            if self.translation.tts:
+                if stop_intent == "stop_program":
+                    self.translation.tts.start(
+                        "Stopping. Goodbye.",
+                        timeout_s=self.tts_timeout,
+                    )
+                else:
+                    self.translation.tts.start(
+                        "Stopping. Say the wake word when you need me again.",
+                        timeout_s=self.tts_timeout,
+                    )
+            return stop_intent
 
         self.logger.info("Translating wake word transcription...")
         self.translation.translate_transcription(transcription)
+        return None
 
     def _with_processing_lock(self, fn: Callable[[], None]) -> None:
         """Avoid overlapping wake-word callbacks."""
@@ -251,7 +273,11 @@ class WakeWordTranslationAssistant:
 
                 if self.translation.source_lang != "en":
                     self.translation.stt.delete_last_audio_file()
-                self._handle_translate_mode()
+                translate_stop_intent = self._handle_translate_mode()
+                if translate_stop_intent:
+                    if translate_stop_intent == "stop_program":
+                        self._should_exit = True
+                    return
                 if not self.stay_awake:
                     return
                 if self.prompt_user and self.translation.tts:
