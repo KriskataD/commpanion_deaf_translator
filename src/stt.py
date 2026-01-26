@@ -61,7 +61,7 @@ class SpeechToTextApplication:
         else:
             print("No audio file to delete or file does not exist.")
 
-    def transcribe(self) -> str:
+    def transcribe(self, language_override: str | None = None, delete: bool = True) -> str:
         """
         Transcribe the first audio file in the records directory.
 
@@ -80,13 +80,18 @@ class SpeechToTextApplication:
         audio_file = self._get_audio_file()
         result = self.model.transcribe(
             str(audio_file),
-            language=self.language,
+            language=language_override if language_override is not None else self.language,
             task=self.task,
         )
         transcription = result.get("text", "").strip()
         print(f"Transcription result: {transcription}")
-        self._delete_audio_file()
+        if delete:
+            self._delete_audio_file()
         return transcription
+
+    def delete_last_audio_file(self) -> None:
+        """Delete the last processed audio file, if present."""
+        self._delete_audio_file()
 
 
 def is_openai_whisper_available() -> bool:
