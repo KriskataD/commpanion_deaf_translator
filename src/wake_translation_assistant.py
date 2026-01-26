@@ -89,6 +89,71 @@ class WakeWordTranslationAssistant:
         normalized = " ".join(transcription.lower().split())
         return "stop listening" in normalized or "stop jarvis" in normalized
 
+    @staticmethod
+    def _get_mode_intent(transcription: str) -> str | None:
+        normalized = " ".join(transcription.lower().split())
+        if "translate" in normalized:
+            return "translate"
+        if "detect" in normalized:
+            return "detect"
+        return None
+
+    def _handle_translate_mode(self) -> str | None:
+        if self.translation.tts:
+            self.translation.tts.start(
+                "Ready to translate. Please say what you want translated.",
+                timeout_s=self.tts_timeout,
+            )
+        time.sleep(0.1)
+        audio_path = self.translation.record(filename="last_rec.wav")
+        if audio_path:
+            self.logger.info("Translation audio captured: %s", audio_path)
+        if not audio_path:
+            self.logger.warning("No audio captured for translation.")
+            if self.translation.tts:
+                self.translation.tts.start(
+                    "I did not catch anything to translate. Please try again.",
+                    timeout_s=self.tts_timeout,
+                )
+            return None
+
+        self.logger.info("Transcribing translation audio...")
+        transcription = self.translation.transcribe(delete=self.translation.source_lang == "en")
+        if not transcription or not transcription.strip():
+            if self.translation.source_lang != "en":
+                self.translation.stt.delete_last_audio_file()
+            if self.translation.tts:
+                self.translation.tts.start(
+                    "I did not catch that. Please try again.",
+                    timeout_s=self.tts_timeout,
+                )
+            return None
+
+        stop_intent = self._get_stop_intent(transcription)
+        if self.translation.source_lang != "en":
+            english_transcription = self.translation.transcribe(language_override="en", delete=True)
+            english_stop_intent = self._get_stop_intent(english_transcription)
+            if english_stop_intent:
+                stop_intent = english_stop_intent
+
+        if stop_intent:
+            if self.translation.tts:
+                if stop_intent == "stop_program":
+                    self.translation.tts.start(
+                        "Stopping. Goodbye.",
+                        timeout_s=self.tts_timeout,
+                    )
+                else:
+                    self.translation.tts.start(
+                        "Stopping. Say the wake word when you need me again.",
+                        timeout_s=self.tts_timeout,
+                    )
+            return stop_intent
+
+        self.logger.info("Translating wake word transcription...")
+        self.translation.translate_transcription(transcription)
+        return None
+
     def _with_processing_lock(self, fn: Callable[[], None]) -> None:
         """Avoid overlapping wake-word callbacks."""
         with self._processing_lock:
@@ -115,9 +180,9 @@ class WakeWordTranslationAssistant:
             if self.prompt_user and self.translation.tts:
                 self.logger.info("Prompting user before recording.")
                 prompt_text = (
-                    "What can I do for you? Say translate to begin."
+                    "What can I do for you? Say translate or detect to begin."
                     if not self.stay_awake
-                    else "Ready. Say what you want translated. Say stop listening to finish."
+                    else "Ready. Say translate to translate or detect for sign language. Say stop listening to finish."
                 )
                 self.translation.tts.start(prompt_text, timeout_s=self.tts_timeout)
                 self.logger.info("Prompt completed. Starting recording.")
@@ -147,16 +212,6 @@ class WakeWordTranslationAssistant:
                 print(f"📝 Transcription result: {prompt}")
                 self.logger.info("Command captured: %s", normalized)
 
-                if "sign language" in normalized or "signing" in normalized:
-                    if self.translation.source_lang != "en":
-                        self.translation.stt.delete_last_audio_file()
-                    if self.translation.tts:
-                        self.translation.tts.start(
-                            "Sign language detection pipeline is not ready yet.",
-                            timeout_s=self.tts_timeout,
-                        )
-                    return
-
                 stop_intent = self._get_stop_intent(prompt)
                 if stop_intent:
                     if self.translation.source_lang != "en":
@@ -175,6 +230,7 @@ class WakeWordTranslationAssistant:
                     if stop_intent == "stop_program":
                         self._should_exit = True
                     return
+                command_for_mode = prompt
                 if self.translation.source_lang != "en":
                     english_prompt = self.translation.transcribe(language_override="en", delete=True)
                     stop_intent = self._get_stop_intent(english_prompt)
@@ -193,16 +249,40 @@ class WakeWordTranslationAssistant:
                         if stop_intent == "stop_program":
                             self._should_exit = True
                         return
+                    if english_prompt:
+                        command_for_mode = english_prompt
 
-                # Default path: translate from configured source->target languages.
-                self.logger.info("Translating wake word transcription...")
-                self.translation.translate_transcription(prompt)
+                mode_intent = self._get_mode_intent(command_for_mode)
+                if not mode_intent:
+                    if self.translation.tts:
+                        self.translation.tts.start(
+                            "Please say translate or detect.",
+                            timeout_s=self.tts_timeout,
+                        )
+                    continue
 
+                if mode_intent == "detect":
+                    if self.translation.source_lang != "en":
+                        self.translation.stt.delete_last_audio_file()
+                    if self.translation.tts:
+                        self.translation.tts.start(
+                            "Sign language detection pipeline is not ready yet.",
+                            timeout_s=self.tts_timeout,
+                        )
+                    return
+
+                if self.translation.source_lang != "en":
+                    self.translation.stt.delete_last_audio_file()
+                translate_stop_intent = self._handle_translate_mode()
+                if translate_stop_intent:
+                    if translate_stop_intent == "stop_program":
+                        self._should_exit = True
+                    return
                 if not self.stay_awake:
                     return
                 if self.prompt_user and self.translation.tts:
                     self.translation.tts.start(
-                        "Say another phrase or say stop listening to finish.",
+                        "Say translate or detect to continue, or say stop listening to finish.",
                         timeout_s=self.tts_timeout,
                     )
         finally:
