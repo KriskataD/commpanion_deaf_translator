@@ -74,6 +74,11 @@ class WakeWordTranslationAssistant:
         self._processing_lock = threading.Lock()
         self._is_processing = False
 
+    @staticmethod
+    def _is_stop_command(transcription: str) -> bool:
+        normalized = " ".join(transcription.lower().split())
+        return "stop listening" in normalized
+
     def _with_processing_lock(self, fn: Callable[[], None]) -> None:
         """Avoid overlapping wake-word callbacks."""
         with self._processing_lock:
@@ -107,13 +112,13 @@ class WakeWordTranslationAssistant:
                 self.translation.tts.start(prompt_text, timeout_s=self.tts_timeout)
                 self.logger.info("Prompt completed. Starting recording.")
 
-            stop_phrases = {
-                "stop listening",
-                "stop",
-                "exit",
-                "quit",
-                "cancel",
-            }
+            #stop_phrases = {
+            #    "stop listening",
+            #    "stop",
+            #    "exit",
+            #    "quit",
+            #    "cancel",
+            #}
             while True:
                 time.sleep(0.1)  # let the prompt finish before capturing audio
                 audio_path = self.translation.record(filename="last_rec.wav")
@@ -145,7 +150,7 @@ class WakeWordTranslationAssistant:
                         )
                     return
 
-                if normalized in stop_phrases or "stop listening" in normalized:
+                if self._is_stop_command(prompt):
                     if self.translation.tts:
                         self.translation.tts.start(
                             "Stopping. Say the wake word when you need me again.",
