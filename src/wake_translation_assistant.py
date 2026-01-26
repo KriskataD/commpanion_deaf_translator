@@ -77,7 +77,7 @@ class WakeWordTranslationAssistant:
     @staticmethod
     def _is_stop_command(transcription: str) -> bool:
         normalized = " ".join(transcription.lower().split())
-        return "stop listening" in normalized
+        return "stop listening" in normalized or "stop jarvis" in normalized
 
     def _with_processing_lock(self, fn: Callable[[], None]) -> None:
         """Avoid overlapping wake-word callbacks."""
