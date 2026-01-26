@@ -110,9 +110,9 @@ class TranslatorPipeline:
             self.recorder.cleanup()
         return output_path if output_path.exists() else None
 
-    def transcribe(self) -> str:
+    def transcribe(self, language_override: str | None = None, delete: bool = True) -> str:
         """Transcribe the last recorded audio file using Whisper."""
-        return self.stt.transcribe()
+        return self.stt.transcribe(language_override=language_override, delete=delete)
 
     def set_languages(self, source_lang: str, target_lang: str) -> None:
         """Update the language pair for subsequent translations."""
