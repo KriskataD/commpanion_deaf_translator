@@ -73,6 +73,16 @@ class WakeWordTranslationAssistant:
 
         self._processing_lock = threading.Lock()
         self._is_processing = False
+        self._should_exit = False
+
+    @staticmethod
+    def _get_stop_intent(transcription: str) -> str | None:
+        normalized = " ".join(transcription.lower().split())
+        if "stop jarvis" in normalized:
+            return "stop_program"
+        if "stop listening" in normalized:
+            return "stop_listening"
+        return None
 
     @staticmethod
     def _is_stop_command(transcription: str) -> bool:
@@ -147,23 +157,41 @@ class WakeWordTranslationAssistant:
                         )
                     return
 
-                if self._is_stop_command(prompt):
+                stop_intent = self._get_stop_intent(prompt)
+                if stop_intent:
                     if self.translation.source_lang != "en":
                         self.translation.stt.delete_last_audio_file()
                     if self.translation.tts:
-                        self.translation.tts.start(
-                            "Stopping. Say the wake word when you need me again.",
-                            timeout_s=self.tts_timeout,
-                        )
-                    return
-                if self.translation.source_lang != "en":
-                    english_prompt = self.translation.transcribe(language_override="en", delete=True)
-                    if self._is_stop_command(english_prompt):
-                        if self.translation.tts:
+                        if stop_intent == "stop_program":
+                            self.translation.tts.start(
+                                "Stopping. Goodbye.",
+                                timeout_s=self.tts_timeout,
+                            )
+                        else:
                             self.translation.tts.start(
                                 "Stopping. Say the wake word when you need me again.",
                                 timeout_s=self.tts_timeout,
                             )
+                    if stop_intent == "stop_program":
+                        self._should_exit = True
+                    return
+                if self.translation.source_lang != "en":
+                    english_prompt = self.translation.transcribe(language_override="en", delete=True)
+                    stop_intent = self._get_stop_intent(english_prompt)
+                    if stop_intent:
+                        if self.translation.tts:
+                            if stop_intent == "stop_program":
+                                self.translation.tts.start(
+                                    "Stopping. Goodbye.",
+                                    timeout_s=self.tts_timeout,
+                                )
+                            else:
+                                self.translation.tts.start(
+                                    "Stopping. Say the wake word when you need me again.",
+                                    timeout_s=self.tts_timeout,
+                                )
+                        if stop_intent == "stop_program":
+                            self._should_exit = True
                         return
 
                 # Default path: translate from configured source->target languages.
@@ -178,7 +206,8 @@ class WakeWordTranslationAssistant:
                         timeout_s=self.tts_timeout,
                     )
         finally:
-            self.detector.start()
+            if not self._should_exit:
+                self.detector.start()
 
     def run(self) -> None:
         """Start wake-word listening loop."""
@@ -188,7 +217,7 @@ class WakeWordTranslationAssistant:
         )
         try:
             self.detector.start()
-            while True:
+            while not self._should_exit:
                 time.sleep(1)
         except KeyboardInterrupt:
             print("\n🛑 Shutting down...")
