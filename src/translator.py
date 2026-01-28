@@ -70,25 +70,10 @@ class TranslatorPipeline:
         self.tts_timeout = tts_timeout
 
         self.recorder = AudioRecorder()
-        if not is_openai_whisper_available():
-            raise RuntimeError(
-                "openai-whisper is not installed. Install it with `pip install openai-whisper`."
-            )
-        model_name = "base"
-        if stt_model:
-            if not stt_model.startswith("openai_whisper"):
-                raise ValueError(
-                    "Unsupported STT model. Use openai_whisper[:model] (e.g., openai_whisper:base)."
-                )
-            if ":" in stt_model:
-                _, model_name = stt_model.split(":", 1)
-        self.stt = SpeechToTextApplication(
-            audio_records_path=self.audio_dir,
-            model_name=model_name,
-            language=source_lang if source_lang else None,
-        )
+        self.stt = self._build_stt_backend(stt_model)
         self.translator = MultiLanguageTranslator()
         self.tts = _TTS() if self.speak else None
+        self.last_audio_path: Path | None = None
 
         self._mic_lock = threading.Lock()
         default_mic = self.recorder.mic_selector.get_default_microphone()
@@ -108,11 +93,56 @@ class TranslatorPipeline:
             output_path = self.audio_dir / filename
             self.recorder.save_recording(str(output_path))
             self.recorder.cleanup()
-        return output_path if output_path.exists() else None
+        self.last_audio_path = output_path if output_path.exists() else None
+        return self.last_audio_path
 
     def transcribe(self, language_override: str | None = None, delete: bool = True) -> str:
         """Transcribe the last recorded audio file using Whisper."""
+        if hasattr(self.stt, "transcribe_wav"):
+            if not self.last_audio_path:
+                raise FileNotFoundError("No recorded audio available for QNN STT.")
+            result = self.stt.transcribe_wav(self.last_audio_path, language=language_override)
+            if delete and self.last_audio_path.exists():
+                self.last_audio_path.unlink()
+            return result
         return self.stt.transcribe(language_override=language_override, delete=delete)
+
+    def _build_stt_backend(self, stt_model: str | None):
+        if stt_model == "qnn_whisper_small_quantized":
+            from .npu.whisper_qnn_stt import WhisperSmallQuantizedQNNSTT
+
+            encoder_dir = Path(
+                r"D:\\KristianD\\commpanion_deaf_translator\\src\\models\\"
+                "whisper_small_quantized_encoder_optimized_onnx"
+            )
+            decoder_dir = Path(
+                r"D:\\KristianD\\commpanion_deaf_translator\\src\\models\\"
+                "whisper_small_quantized_decoder_optimized_onnx"
+            )
+            return WhisperSmallQuantizedQNNSTT(
+                encoder_dir=encoder_dir,
+                decoder_dir=decoder_dir,
+                debug=False,
+            )
+
+        if not is_openai_whisper_available():
+            raise RuntimeError(
+                "openai-whisper is not installed. Install it with `pip install openai-whisper`."
+            )
+        model_name = "base"
+        if stt_model:
+            if not stt_model.startswith("openai_whisper"):
+                raise ValueError(
+                    "Unsupported STT model. Use openai_whisper[:model] "
+                    "(e.g., openai_whisper:base) or qnn_whisper_small_quantized."
+                )
+            if ":" in stt_model:
+                _, model_name = stt_model.split(":", 1)
+        return SpeechToTextApplication(
+            audio_records_path=self.audio_dir,
+            model_name=model_name,
+            language=self.source_lang if self.source_lang else None,
+        )
 
     def set_languages(self, source_lang: str, target_lang: str) -> None:
         """Update the language pair for subsequent translations."""
@@ -184,7 +214,8 @@ def main() -> None:
         "--stt-model",
         help=(
             "Whisper STT model to use. Supported values: openai_whisper[:model] "
-            "(e.g., openai_whisper:small). Defaults to openai_whisper:base."
+            "(e.g., openai_whisper:small) or qnn_whisper_small_quantized. "
+            "Defaults to openai_whisper:base."
         ),
     )
     parser.add_argument("--no-speak", action="store_true", help="Disable TTS playback of translations.")
