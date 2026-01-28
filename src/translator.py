@@ -7,6 +7,7 @@ transcribed, translated, and the translated text is printed and spoken.
 from __future__ import annotations
 
 import argparse
+import importlib
 import threading
 import time
 from pathlib import Path
@@ -109,8 +110,8 @@ class TranslatorPipeline:
 
     def _build_stt_backend(self, stt_model: str | None):
         if stt_model == "qnn_whisper_small_quantized":
-            from .npu.whisper_qnn_stt import WhisperSmallQuantizedQNNSTT
-
+            whisper_qnn_module = importlib.import_module(".npu.whisper_qnn_stt", package=__package__)
+            whisper_cls = getattr(whisper_qnn_module, "WhisperSmallQuantizedQNNSTT")
             encoder_dir = Path(
                 r"D:\\KristianD\\commpanion_deaf_translator\\src\\models\\"
                 "whisper_small_quantized_encoder_optimized_onnx"
@@ -119,7 +120,7 @@ class TranslatorPipeline:
                 r"D:\\KristianD\\commpanion_deaf_translator\\src\\models\\"
                 "whisper_small_quantized_decoder_optimized_onnx"
             )
-            return WhisperSmallQuantizedQNNSTT(
+            return whisper_cls(
                 encoder_dir=encoder_dir,
                 decoder_dir=decoder_dir,
                 debug=False,
