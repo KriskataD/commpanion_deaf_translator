@@ -118,7 +118,16 @@ class WakeWordTranslationAssistant:
             return None
 
         self.logger.info("Transcribing translation audio...")
-        transcription = self.translation.transcribe(delete=self.translation.source_lang == "en")
+        try:
+            transcription = self.translation.transcribe(delete=self.translation.source_lang == "en")
+        except Exception:
+            self.logger.exception("Translation transcription failed.")
+            if self.translation.tts:
+                self.translation.tts.start(
+                    "I had trouble understanding that. Please try again.",
+                    timeout_s=self.tts_timeout,
+                )
+            return None
         if not transcription or not transcription.strip():
             if self.translation.source_lang != "en":
                 self.translation.stt.delete_last_audio_file()
@@ -197,7 +206,18 @@ class WakeWordTranslationAssistant:
                     return
 
                 self.logger.info("Transcribing wake word audio...")
-                prompt = self.translation.transcribe(delete=self.translation.source_lang == "en")
+                try:
+                    prompt = self.translation.transcribe(
+                        delete=self.translation.source_lang == "en",
+                    )
+                except Exception:
+                    self.logger.exception("Wake word transcription failed.")
+                    if self.translation.tts:
+                        self.translation.tts.start(
+                            "I had trouble understanding that. Please try again.",
+                            timeout_s=self.tts_timeout,
+                        )
+                    return
                 if not prompt or not prompt.strip():
                     if self.translation.source_lang != "en":
                         self.translation.stt.delete_last_audio_file()
