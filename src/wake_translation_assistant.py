@@ -33,6 +33,7 @@ class WakeWordTranslationAssistant:
         speak: bool = True,
         prompt_user: bool = True,
         stay_awake: bool = False,
+        stt_timeout: float | None = None,
         tts_timeout: float | None = None,
     ) -> None:
         WakeWordDetector.download_models()
@@ -46,6 +47,7 @@ class WakeWordTranslationAssistant:
             target_lang=target_lang,
             speak=speak,
             stt_model=stt_model,
+            stt_timeout=stt_timeout,
             tts_timeout=tts_timeout,
         )
         self.prompt_user = prompt_user
@@ -118,7 +120,16 @@ class WakeWordTranslationAssistant:
             return None
 
         self.logger.info("Transcribing translation audio...")
-        transcription = self.translation.transcribe(delete=self.translation.source_lang == "en")
+        try:
+            transcription = self.translation.transcribe(delete=self.translation.source_lang == "en")
+        except Exception:
+            self.logger.exception("Translation transcription failed.")
+            if self.translation.tts:
+                self.translation.tts.start(
+                    "I had trouble understanding that. Please try again.",
+                    timeout_s=self.tts_timeout,
+                )
+            return None
         if not transcription or not transcription.strip():
             if self.translation.source_lang != "en":
                 self.translation.stt.delete_last_audio_file()
@@ -197,7 +208,18 @@ class WakeWordTranslationAssistant:
                     return
 
                 self.logger.info("Transcribing wake word audio...")
-                prompt = self.translation.transcribe(delete=self.translation.source_lang == "en")
+                try:
+                    prompt = self.translation.transcribe(
+                        delete=self.translation.source_lang == "en",
+                    )
+                except Exception:
+                    self.logger.exception("Wake word transcription failed.")
+                    if self.translation.tts:
+                        self.translation.tts.start(
+                            "I had trouble understanding that. Please try again.",
+                            timeout_s=self.tts_timeout,
+                        )
+                    return
                 if not prompt or not prompt.strip():
                     if self.translation.source_lang != "en":
                         self.translation.stt.delete_last_audio_file()
@@ -369,6 +391,11 @@ def main() -> None:
         help="Keep listening for additional translations after a wake word until you say 'stop listening'.",
     )
     parser.add_argument(
+        "--stt-timeout",
+        type=float,
+        help="Optional timeout (seconds) for STT transcription to avoid hangs.",
+    )
+    parser.add_argument(
         "--tts-timeout",
         type=float,
         help="Optional timeout (seconds) for TTS playback to avoid hangs.",
@@ -388,6 +415,7 @@ def main() -> None:
         speak=not args.no_speak,
         prompt_user=not args.no_prompt,
         stay_awake=args.stay_awake,
+        stt_timeout=args.stt_timeout,
         tts_timeout=args.tts_timeout,
     )
     assistant.run()

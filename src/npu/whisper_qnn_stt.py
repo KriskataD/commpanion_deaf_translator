@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from typing import Any, Iterable
 import wave
@@ -61,6 +62,7 @@ class WhisperSmallQuantizedQNNSTT:
         prefer_qnn: bool = True,
         debug: bool = False,
     ) -> None:
+        self.logger = logging.getLogger(__name__)
         self.encoder_dir = Path(encoder_dir)
         self.decoder_dir = Path(decoder_dir)
         self.prefer_qnn = prefer_qnn
@@ -68,11 +70,17 @@ class WhisperSmallQuantizedQNNSTT:
 
         self.encoder_onnx = self.encoder_dir / "model.onnx"
         self.decoder_onnx = self.decoder_dir / "model.onnx"
+        self.logger.info("QNN encoder model path: %s", self.encoder_onnx)
+        self.logger.info("QNN decoder model path: %s", self.decoder_onnx)
         self._validate_model_files(self.encoder_onnx)
         self._validate_model_files(self.decoder_onnx)
 
-        self.encoder_session = make_session(self.encoder_onnx)
-        self.decoder_session = make_session(self.decoder_onnx)
+        try:
+            self.encoder_session = make_session(self.encoder_onnx)
+            self.decoder_session = make_session(self.decoder_onnx)
+        except Exception:
+            self.logger.exception("Failed to create QNN ONNX Runtime sessions.")
+            raise
 
         self.encoder_io = SessionIoInfo(
             inputs=self.encoder_session.get_inputs(),
@@ -148,6 +156,7 @@ class WhisperSmallQuantizedQNNSTT:
 
     def transcribe_wav(self, wav_path: Path, language: str | None = None) -> str:
         """Transcribe a WAV file to text."""
+        self.logger.info("Starting QNN transcription: %s (language=%s)", wav_path, language or "auto")
         audio = self._load_wav_mono_16k(Path(wav_path))
         features = self._prepare_encoder_features(self._log_mel_spectrogram(audio))
         encoder_inputs = {self.encoder_input_name: features}
@@ -236,7 +245,9 @@ class WhisperSmallQuantizedQNNSTT:
                 break
 
         decoded = self.tokenizer.decode(input_ids, skip_special_tokens=True)
-        return decoded.strip()
+        result = decoded.strip()
+        self.logger.info("Completed QNN transcription (chars=%d).", len(result))
+        return result
 
     def _validate_model_files(self, onnx_path: Path) -> None:
         if not onnx_path.exists():
