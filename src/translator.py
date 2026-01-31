@@ -127,6 +127,8 @@ class TranslatorPipeline:
                 r"D:\\KristianD\\commpanion_deaf_translator\\src\\models\\"
                 "whisper_small_quantized_decoder_optimized_onnx"
             )
+            self.logger.info("QNN encoder directory: %s", encoder_dir)
+            self.logger.info("QNN decoder directory: %s", decoder_dir)
             return whisper_cls(
                 encoder_dir=encoder_dir,
                 decoder_dir=decoder_dir,
