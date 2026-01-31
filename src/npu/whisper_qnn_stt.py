@@ -14,6 +14,35 @@ from transformers import WhisperTokenizer
 from .ort_qnn import make_session
 
 
+def dump_model_io(encoder_dir: str | Path, decoder_dir: str | Path) -> None:
+    """Print encoder/decoder IO metadata without constructing the full STT class."""
+    encoder_dir = Path(encoder_dir)
+    decoder_dir = Path(decoder_dir)
+    encoder_onnx = encoder_dir / "model.onnx"
+    decoder_onnx = decoder_dir / "model.onnx"
+    if not encoder_onnx.exists():
+        raise FileNotFoundError(f"Missing ONNX model: {encoder_onnx}")
+    if not decoder_onnx.exists():
+        raise FileNotFoundError(f"Missing ONNX model: {decoder_onnx}")
+
+    encoder_session = make_session(encoder_onnx)
+    decoder_session = make_session(decoder_onnx)
+
+    print("\nEncoder inputs:")
+    for node in encoder_session.get_inputs():
+        print(f"  - {node.name}: shape={node.shape}, type={node.type}")
+    print("Encoder outputs:")
+    for node in encoder_session.get_outputs():
+        print(f"  - {node.name}: shape={node.shape}, type={node.type}")
+
+    print("\nDecoder inputs:")
+    for node in decoder_session.get_inputs():
+        print(f"  - {node.name}: shape={node.shape}, type={node.type}")
+    print("Decoder outputs:")
+    for node in decoder_session.get_outputs():
+        print(f"  - {node.name}: shape={node.shape}, type={node.type}")
+
+
 @dataclass(frozen=True)
 class SessionIoInfo:
     """Structured IO metadata for an ONNX session."""

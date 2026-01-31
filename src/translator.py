@@ -101,7 +101,11 @@ class TranslatorPipeline:
         """Transcribe the last recorded audio file using Whisper."""
         if hasattr(self.stt, "transcribe_wav"):
             if not self.last_audio_path:
-                raise FileNotFoundError("No recorded audio available for QNN STT.") 
+                raise FileNotFoundError("No recorded audio available for QNN STT.")
+            result = self.stt.transcribe_wav(self.last_audio_path, language=language_override)
+            if delete and self.last_audio_path.exists():
+                self.last_audio_path.unlink()
+            return result
         return self.stt.transcribe(language_override=language_override, delete=delete)
 
     def _build_stt_backend(self, stt_model: str | None):
