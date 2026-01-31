@@ -71,12 +71,12 @@ class TranslatorPipeline:
         self.speak = speak
         self.tts_timeout = tts_timeout
 
+        self.logger = logging.getLogger(__name__)
         self.recorder = AudioRecorder()
         self.stt = self._build_stt_backend(stt_model)
         self.translator = MultiLanguageTranslator()
         self.tts = _TTS() if self.speak else None
         self.last_audio_path: Path | None = None
-        self.logger = logging.getLogger(__name__)
 
         self._mic_lock = threading.Lock()
         default_mic = self.recorder.mic_selector.get_default_microphone()
