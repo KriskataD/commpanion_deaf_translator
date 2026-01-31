@@ -7,12 +7,13 @@ transcribed, translated, and the translated text is printed and spoken.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import importlib
 import logging
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
@@ -61,6 +62,7 @@ class TranslatorPipeline:
         target_lang: str = "fr",
         speak: bool = True,
         stt_model: str | None = None,
+        stt_timeout: float | None = None,
         tts_timeout: float | None = None,
     ) -> None:
         self.audio_dir = Path(audio_dir)
@@ -69,6 +71,7 @@ class TranslatorPipeline:
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.speak = speak
+        self.stt_timeout = stt_timeout
         self.tts_timeout = tts_timeout
 
         self.logger = logging.getLogger(__name__)
@@ -99,21 +102,39 @@ class TranslatorPipeline:
         self.last_audio_path = output_path if output_path.exists() else None
         return self.last_audio_path
 
+    def _run_with_timeout(self, fn: Callable[[], str], label: str) -> str:
+        if self.stt_timeout is None:
+            return fn()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(fn)
+            try:
+                return future.result(timeout=self.stt_timeout)
+            except concurrent.futures.TimeoutError:
+                self.logger.error("%s timed out after %.1fs.", label, self.stt_timeout)
+                future.cancel()
+                return ""
+            except Exception:
+                self.logger.exception("%s failed.", label)
+                return ""
+
     def transcribe(self, language_override: str | None = None, delete: bool = True) -> str:
         """Transcribe the last recorded audio file using Whisper."""
         if hasattr(self.stt, "transcribe_wav"):
             if not self.last_audio_path:
                 raise FileNotFoundError("No recorded audio available for QNN STT.")
             try:
-                result = self.stt.transcribe_wav(self.last_audio_path, language=language_override)
-            except Exception:
-                self.logger.exception("QNN STT transcription failed.")
-                return ""
+                result = self._run_with_timeout(
+                    lambda: self.stt.transcribe_wav(self.last_audio_path, language=language_override),
+                    "QNN STT transcription",
+                )
             finally:
                 if delete and self.last_audio_path.exists():
                     self.last_audio_path.unlink()
             return result
-        return self.stt.transcribe(language_override=language_override, delete=delete)
+        return self._run_with_timeout(
+            lambda: self.stt.transcribe(language_override=language_override, delete=delete),
+            "STT transcription",
+        )
 
     def _build_stt_backend(self, stt_model: str | None):
         if stt_model == "qnn_whisper_small_quantized":
@@ -228,6 +249,11 @@ def main() -> None:
             "Defaults to openai_whisper:base."
         ),
     )
+    parser.add_argument(
+        "--stt-timeout",
+        type=float,
+        help="Optional timeout (seconds) for STT transcription to avoid hangs.",
+    )
     parser.add_argument("--no-speak", action="store_true", help="Disable TTS playback of translations.")
     parser.add_argument(
         "--list-languages",
@@ -248,6 +274,7 @@ def main() -> None:
         target_lang=args.target_lang,
         speak=not args.no_speak,
         stt_model=args.stt_model,
+        stt_timeout=args.stt_timeout,
     )
 
     if args.list_languages:

@@ -33,6 +33,7 @@ class WakeWordTranslationAssistant:
         speak: bool = True,
         prompt_user: bool = True,
         stay_awake: bool = False,
+        stt_timeout: float | None = None,
         tts_timeout: float | None = None,
     ) -> None:
         WakeWordDetector.download_models()
@@ -46,6 +47,7 @@ class WakeWordTranslationAssistant:
             target_lang=target_lang,
             speak=speak,
             stt_model=stt_model,
+            stt_timeout=stt_timeout,
             tts_timeout=tts_timeout,
         )
         self.prompt_user = prompt_user
@@ -389,6 +391,11 @@ def main() -> None:
         help="Keep listening for additional translations after a wake word until you say 'stop listening'.",
     )
     parser.add_argument(
+        "--stt-timeout",
+        type=float,
+        help="Optional timeout (seconds) for STT transcription to avoid hangs.",
+    )
+    parser.add_argument(
         "--tts-timeout",
         type=float,
         help="Optional timeout (seconds) for TTS playback to avoid hangs.",
@@ -408,6 +415,7 @@ def main() -> None:
         speak=not args.no_speak,
         prompt_user=not args.no_prompt,
         stay_awake=args.stay_awake,
+        stt_timeout=args.stt_timeout,
         tts_timeout=args.tts_timeout,
     )
     assistant.run()

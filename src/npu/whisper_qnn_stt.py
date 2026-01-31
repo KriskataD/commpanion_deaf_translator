@@ -156,6 +156,7 @@ class WhisperSmallQuantizedQNNSTT:
 
     def transcribe_wav(self, wav_path: Path, language: str | None = None) -> str:
         """Transcribe a WAV file to text."""
+        self.logger.info("Starting QNN transcription: %s (language=%s)", wav_path, language or "auto")
         audio = self._load_wav_mono_16k(Path(wav_path))
         features = self._prepare_encoder_features(self._log_mel_spectrogram(audio))
         encoder_inputs = {self.encoder_input_name: features}
@@ -244,7 +245,9 @@ class WhisperSmallQuantizedQNNSTT:
                 break
 
         decoded = self.tokenizer.decode(input_ids, skip_special_tokens=True)
-        return decoded.strip()
+        result = decoded.strip()
+        self.logger.info("Completed QNN transcription (chars=%d).", len(result))
+        return result
 
     def _validate_model_files(self, onnx_path: Path) -> None:
         if not onnx_path.exists():
