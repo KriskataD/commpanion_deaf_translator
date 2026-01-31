@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import logging
 import threading
 import time
 from pathlib import Path
@@ -70,6 +71,7 @@ class TranslatorPipeline:
         self.speak = speak
         self.tts_timeout = tts_timeout
 
+        self.logger = logging.getLogger(__name__)
         self.recorder = AudioRecorder()
         self.stt = self._build_stt_backend(stt_model)
         self.translator = MultiLanguageTranslator()
@@ -102,9 +104,14 @@ class TranslatorPipeline:
         if hasattr(self.stt, "transcribe_wav"):
             if not self.last_audio_path:
                 raise FileNotFoundError("No recorded audio available for QNN STT.")
-            result = self.stt.transcribe_wav(self.last_audio_path, language=language_override)
-            if delete and self.last_audio_path.exists():
-                self.last_audio_path.unlink()
+            try:
+                result = self.stt.transcribe_wav(self.last_audio_path, language=language_override)
+            except Exception:
+                self.logger.exception("QNN STT transcription failed.")
+                return ""
+            finally:
+                if delete and self.last_audio_path.exists():
+                    self.last_audio_path.unlink()
             return result
         return self.stt.transcribe(language_override=language_override, delete=delete)
 
@@ -120,6 +127,8 @@ class TranslatorPipeline:
                 r"D:\\KristianD\\commpanion_deaf_translator\\src\\models\\"
                 "whisper_small_quantized_decoder_optimized_onnx"
             )
+            self.logger.info("QNN encoder directory: %s", encoder_dir)
+            self.logger.info("QNN decoder directory: %s", decoder_dir)
             return whisper_cls(
                 encoder_dir=encoder_dir,
                 decoder_dir=decoder_dir,
