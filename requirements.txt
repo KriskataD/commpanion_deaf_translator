@@ -3,9 +3,9 @@ numpy
 pyaudio
 openwakeword==0.6.0
 
-# STT (OpenAI Whisper local)
+# STT (QNN Whisper)
 torch>=2.2.0
-openai-whisper
+onnxruntime
 
 # Translation
 transformers>=4.38.0
