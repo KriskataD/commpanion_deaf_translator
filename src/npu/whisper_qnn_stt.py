@@ -163,6 +163,9 @@ class WhisperSmallQuantizedQNNSTT:
     def transcribe_wav(self, wav_path: Path, language: str | None = None) -> str:
         self.logger.info("Starting QNN transcription: %s (language=%s)", wav_path, language or "auto")
 
+        if self.debug:
+            self._debug_top5_printed = False
+
         audio = self._load_wav_mono_16k(Path(wav_path))
         self.logger.info("WAV loaded. Samples=%d", audio.shape[0])
 
@@ -253,45 +256,7 @@ class WhisperSmallQuantizedQNNSTT:
                 break
 
 
-        # Decide how many tokens we can still generate before hitting the 200 mask limit.
-        # positions are 0..attn_max_len-1
-        remaining_positions = max(0, (self.attn_max_len - pos))
-        max_new_tokens = min(200, remaining_positions)  # keep your 200, but never exceed max positions
-
-        self.logger.info(
-            "Decoder prefill done. pos=%d attn_max_len=%d -> max_new_tokens=%d",
-            pos, self.attn_max_len, max_new_tokens
-        )
-
-        # If last prefill produced logits, pick next token as first generated
-        for step in range(max_new_tokens):
-            if step % 10 == 0:
-                self.logger.info("Decoder gen step %d/%d", step + 1, max_new_tokens)
-
-            if logits is None:
-                # should not happen, but safety
-                logits, kv_cache = self._decoder_step(
-                    token_id=input_ids[-1],
-                    pos=pos,
-                    kv_cache=kv_cache,
-                    enc_cross_cache=enc_cross_cache,
-                )
-            next_token = int(self._select_next_token_from_logits(logits))
-            input_ids.append(next_token)
-
-            if next_token == eot_token:
-                break
-
-            pos += 1
-            if pos >= self.attn_max_len:
-                break
-
-            logits, kv_cache = self._decoder_step(
-                token_id=next_token,
-                pos=pos,
-                kv_cache=kv_cache,
-                enc_cross_cache=enc_cross_cache,
-            )
+        
 
         decoded_raw = self.tokenizer.decode(input_ids, skip_special_tokens=False).strip()
         decoded = self.tokenizer.decode(input_ids, skip_special_tokens=True).strip()
@@ -376,23 +341,40 @@ class WhisperSmallQuantizedQNNSTT:
 
     def _select_next_token_from_logits(self, logits: np.ndarray) -> int:
         x = np.squeeze(logits)
+
+        # Make sure we end up with [vocab]
         if x.ndim != 1:
             x = x.reshape(-1)
 
-        # Interpret output as signed if model exported logits as uint16 container
+        # QNN often returns fp16 packed as uint16 bits
         if x.dtype == np.uint16:
-            x = x.view(np.int16)
+            # Interpret as float16 bit-patterns (NOT int16)
+            x = x.view(np.float16).astype(np.float32)
+            scores = x
+        else:
+            # Normal case
+            scores = x.astype(np.float32)
 
-        # Work in int32 so we can set a very negative value safely
-        scores = x.astype(np.int32)
-
-        # Suppress Whisper control/special tokens (HF does this internally)
+        # Suppress Whisper control/special tokens
         if getattr(self, "suppress_tokens", None):
             for tid in self.suppress_tokens:
                 if 0 <= tid < scores.shape[0]:
-                    scores[tid] = -10**9
+                    scores[tid] = -1e9
+
+        # ✅ DEBUG: print top-5 once per transcription
+        if not hasattr(self, "_debug_top5_printed"):
+            self._debug_top5_printed = True
+            s = scores.copy()
+            top = np.argsort(s)[-5:][::-1]
+            self.logger.info("Top-5 token ids: %s", top.tolist())
+            self.logger.info(
+                "Top-5 tokens: %s",
+                [self.tokenizer.decode([int(t)], skip_special_tokens=False) for t in top],
+            )
+            self.logger.info("Top-5 scores: %s", [float(s[int(t)]) for t in top])
 
         return int(np.argmax(scores))
+
 
     # --------------------------
     # IO discovery helpers
