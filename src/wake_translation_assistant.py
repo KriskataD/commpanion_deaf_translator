@@ -24,7 +24,8 @@ class WakeWordTranslationAssistant:
         audio_dir: Path | str = "audio",
         source_lang: str = "en",
         target_lang: str = "fr",
-        stt_model: str | None = None,
+        qnn_encoder_dir: Path | str = "models/whisper_small_quantized_encoder_optimized_onnx",
+        qnn_decoder_dir: Path | str = "models/whisper_small_quantized_decoder_optimized_onnx",
         wakeword_models: list[str] | None = None,
         wakeword_threshold: float = 0.25,
         wakeword_device_index: int | None = None,
@@ -46,7 +47,8 @@ class WakeWordTranslationAssistant:
             source_lang=source_lang,
             target_lang=target_lang,
             speak=speak,
-            stt_model=stt_model,
+            qnn_encoder_dir=qnn_encoder_dir,
+            qnn_decoder_dir=qnn_decoder_dir,
             stt_timeout=stt_timeout,
             tts_timeout=tts_timeout,
         )
@@ -132,7 +134,7 @@ class WakeWordTranslationAssistant:
             return None
         if not transcription or not transcription.strip():
             if self.translation.source_lang != "en":
-                self.translation.stt.delete_last_audio_file()
+                self.translation.delete_last_audio_file()
             if self.translation.tts:
                 self.translation.tts.start(
                     "I did not catch that. Please try again.",
@@ -222,7 +224,7 @@ class WakeWordTranslationAssistant:
                     return
                 if not prompt or not prompt.strip():
                     if self.translation.source_lang != "en":
-                        self.translation.stt.delete_last_audio_file()
+                        self.translation.delete_last_audio_file()
                     if self.translation.tts:
                         self.translation.tts.start(
                             "I did not catch that. Please try again.",
@@ -237,7 +239,7 @@ class WakeWordTranslationAssistant:
                 stop_intent = self._get_stop_intent(prompt)
                 if stop_intent:
                     if self.translation.source_lang != "en":
-                        self.translation.stt.delete_last_audio_file()
+                        self.translation.delete_last_audio_file()
                     if self.translation.tts:
                         if stop_intent == "stop_program":
                             self.translation.tts.start(
@@ -285,7 +287,7 @@ class WakeWordTranslationAssistant:
 
                 if mode_intent == "detect":
                     if self.translation.source_lang != "en":
-                        self.translation.stt.delete_last_audio_file()
+                        self.translation.delete_last_audio_file()
                     if self.translation.tts:
                         self.translation.tts.start(
                             "Sign language detection pipeline is not ready yet.",
@@ -294,7 +296,7 @@ class WakeWordTranslationAssistant:
                     return
 
                 if self.translation.source_lang != "en":
-                    self.translation.stt.delete_last_audio_file()
+                    self.translation.delete_last_audio_file()
                 translate_stop_intent = self._handle_translate_mode()
                 if translate_stop_intent:
                     if translate_stop_intent == "stop_program":
@@ -342,11 +344,14 @@ def main() -> None:
         help="Directory where microphone captures are stored.",
     )
     parser.add_argument(
-        "--stt-model",
-        help=(
-            "Whisper STT model to use. Supported values: openai_whisper[:model] "
-            "(e.g., openai_whisper:small). Defaults to openai_whisper:base."
-        ),
+        "--qnn-encoder-dir",
+        default="models/whisper_small_quantized_encoder_optimized_onnx",
+        help="Directory containing the QNN Whisper encoder ONNX model (or set QNN_ENCODER_DIR).",
+    )
+    parser.add_argument(
+        "--qnn-decoder-dir",
+        default="models/whisper_small_quantized_decoder_optimized_onnx",
+        help="Directory containing the QNN Whisper decoder ONNX model (or set QNN_DECODER_DIR).",
     )
     parser.add_argument(
         "--wakeword",
@@ -406,7 +411,8 @@ def main() -> None:
         audio_dir=args.audio_dir,
         source_lang=args.source_lang,
         target_lang=args.target_lang,
-        stt_model=args.stt_model,
+        qnn_encoder_dir=args.qnn_encoder_dir,
+        qnn_decoder_dir=args.qnn_decoder_dir,
         wakeword_models=args.wakeword,
         wakeword_threshold=args.wake_threshold,
         wakeword_device_index=args.wake_mic_index,
