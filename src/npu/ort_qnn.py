@@ -11,15 +11,22 @@ def get_providers() -> list[str]:
     return ort.get_available_providers()
 
 
-def make_session(onnx_path: str | Path) -> ort.InferenceSession:
-    """Create an ONNX Runtime session with QNN preferred, CPU fallback."""
+def make_session(
+    onnx_path: str | Path,
+    providers: list[str] | None = None,
+) -> ort.InferenceSession:
+    """Create an ONNX Runtime session with QNN only by default."""
     onnx_path = str(onnx_path)
     available = get_providers()
-    if "QNNExecutionProvider" in available:
+    providers = providers or ["QNNExecutionProvider"]
+    if "QNNExecutionProvider" in providers:
+        if "QNNExecutionProvider" not in available:
+            raise RuntimeError(
+                "QNNExecutionProvider is required but not available. "
+                "Ensure the Qualcomm QNN runtime is installed and ONNX Runtime "
+                "is built with QNN support."
+            )
         print("✅ QNNExecutionProvider is available.")
-    else:
-        print("⚠️ QNNExecutionProvider not available; falling back to CPUExecutionProvider.")
 
     sess_options = ort.SessionOptions()
-    providers = ["QNNExecutionProvider", "CPUExecutionProvider"]
     return ort.InferenceSession(onnx_path, sess_options=sess_options, providers=providers)
