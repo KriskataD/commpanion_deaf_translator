@@ -157,16 +157,22 @@ class WhisperSmallQuantizedQNNSTT:
     def transcribe_wav(self, wav_path: Path, language: str | None = None) -> str:
         """Transcribe a WAV file to text."""
         self.logger.info("Starting QNN transcription: %s (language=%s)", wav_path, language or "auto")
+        self.logger.info("Loading WAV file.")
         audio = self._load_wav_mono_16k(Path(wav_path))
+        self.logger.info("WAV loaded. Samples=%d", audio.shape[0])
+        self.logger.info("Computing log-mel spectrogram.")
         features = self._prepare_encoder_features(self._log_mel_spectrogram(audio))
+        self.logger.info("Encoder features ready. Shape=%s, dtype=%s", features.shape, features.dtype)
         encoder_inputs = {self.encoder_input_name: features}
         if self.encoder_outputs_are_cross_cache:
+            self.logger.info("Running encoder (cross-cache outputs).")
             encoder_outputs = self.encoder_session.run(self.encoder_cross_cache_names, encoder_inputs)
             encoder_hidden_states = None
             encoder_cross_cache = {
                 name: value for name, value in zip(self.encoder_cross_cache_names, encoder_outputs)
             }
         else:
+            self.logger.info("Running encoder (hidden states output).")
             encoder_outputs = self.encoder_session.run(
                 [self.encoder_output_name],
                 encoder_inputs,
@@ -181,9 +187,16 @@ class WhisperSmallQuantizedQNNSTT:
         if eot_token is None:
             raise RuntimeError("Tokenizer does not define eos_token_id.")
 
+        self.logger.info(
+            "Starting decoder loop. max_new_tokens=%d, has_kv_cache=%s",
+            max_new_tokens,
+            self.has_kv_cache,
+        )
         past_cache = self._initialize_past_cache() if self.has_kv_cache else None
         cache_ready = False
         for step in range(max_new_tokens):
+            if step % 10 == 0:
+                self.logger.info("Decoder step %d/%d", step + 1, max_new_tokens)
             input_ids_to_feed = self._prepare_decoder_input_ids(input_ids, cache_ready)
             decoder_inputs: dict[str, Any] = {
                 self.decoder_input_ids_name: np.array([input_ids_to_feed], dtype=np.int32),
@@ -220,6 +233,7 @@ class WhisperSmallQuantizedQNNSTT:
             if past_cache is not None:
                 decoder_inputs.update(past_cache)
 
+            self.logger.info("Running decoder session.")
             outputs = self.decoder_session.run(None, decoder_inputs)
             output_map = {node.name: value for node, value in zip(self.decoder_io.outputs, outputs)}
 
