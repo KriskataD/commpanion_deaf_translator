@@ -1,6 +1,7 @@
 """ONNX Runtime helpers for QNN execution."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import onnxruntime as ort
@@ -19,6 +20,7 @@ def make_session(
     onnx_path = str(onnx_path)
     available = get_providers()
     providers = providers or ["QNNExecutionProvider"]
+    qnn_backend_path = os.getenv("QNN_BACKEND_PATH")
     if "QNNExecutionProvider" in providers:
         if "QNNExecutionProvider" not in available:
             raise RuntimeError(
@@ -29,4 +31,11 @@ def make_session(
         print("✅ QNNExecutionProvider is available.")
 
     sess_options = ort.SessionOptions()
-    return ort.InferenceSession(onnx_path, sess_options=sess_options, providers=providers)
+    ort_providers: list[str] | list[tuple[str, dict[str, str]]] = providers
+    if qnn_backend_path and "QNNExecutionProvider" in providers:
+        ort_providers = [
+            ("QNNExecutionProvider", {"backend_path": qnn_backend_path}),
+            *[provider for provider in providers if provider != "QNNExecutionProvider"],
+        ]
+        print(f"✅ Using QNN backend path: {qnn_backend_path}")
+    return ort.InferenceSession(onnx_path, sess_options=sess_options, providers=ort_providers)

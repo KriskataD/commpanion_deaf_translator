@@ -191,6 +191,11 @@ class TranslatorPipeline:
             self.last_audio_path.unlink()
         self.last_audio_path = None
 
+    def delete_last_audio_file(self) -> None:
+        if self.last_audio_path and self.last_audio_path.exists():
+            self.last_audio_path.unlink()
+        self.last_audio_path = None
+
     def set_languages(self, source_lang: str, target_lang: str) -> None:
         """Update the language pair for subsequent translations."""
         self.source_lang = source_lang
