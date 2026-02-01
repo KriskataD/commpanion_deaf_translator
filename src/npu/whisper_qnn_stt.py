@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Any, Iterable
 import wave
+import time
 
 import numpy as np
 import onnxruntime as ort
@@ -47,8 +48,6 @@ def dump_model_io(encoder_dir: str | Path, decoder_dir: str | Path) -> None:
 
 @dataclass(frozen=True)
 class SessionIoInfo:
-    """Structured IO metadata for an ONNX session."""
-
     inputs: list[ort.NodeArg]
     outputs: list[ort.NodeArg]
 
@@ -71,19 +70,18 @@ class WhisperSmallQuantizedQNNSTT:
 
         self.encoder_onnx = self.encoder_dir / "model.onnx"
         self.decoder_onnx = self.decoder_dir / "model.onnx"
+
         self.logger.info("QNN encoder model path: %s", self.encoder_onnx)
         self.logger.info("QNN decoder model path: %s", self.decoder_onnx)
+
         self._validate_model_files(self.encoder_onnx)
         self._validate_model_files(self.decoder_onnx)
 
         try:
-            self.encoder_session = make_session(
-                self.encoder_onnx,
-                providers=self._get_encoder_providers(),
-            )
-            self.decoder_session = make_session(self.decoder_onnx)
+            self.encoder_session = make_session(self.encoder_onnx, providers=self._get_encoder_providers())
+            self.decoder_session = make_session(self.decoder_onnx, providers=self._get_decoder_providers())
         except Exception:
-            self.logger.exception("Failed to create QNN ONNX Runtime sessions.")
+            self.logger.exception("Failed to create ONNX Runtime sessions.")
             raise
 
         self.encoder_io = SessionIoInfo(
@@ -95,55 +93,54 @@ class WhisperSmallQuantizedQNNSTT:
             outputs=self.decoder_session.get_outputs(),
         )
 
-        self.encoder_input_name = self._find_encoder_input_name()
+        # Names from IO
+        self.encoder_input_name = self._must_find(self.encoder_io.inputs, ["input_features"])
         self.encoder_cross_cache_names = self._find_cross_cache_names(self.encoder_io.outputs)
-        self.encoder_outputs_are_cross_cache = bool(self.encoder_cross_cache_names)
-        self.encoder_output_name = (
-            None if self.encoder_outputs_are_cross_cache else self._find_encoder_output_name()
-        )
 
-        self.decoder_input_ids_name = self._find_decoder_input_ids_name()
+        self.decoder_input_ids_name = self._must_find(self.decoder_io.inputs, ["input_ids"])
+        self.decoder_attention_mask_name = self._must_find(self.decoder_io.inputs, ["attention_mask"])
+        self.decoder_position_ids_name = self._must_find(self.decoder_io.inputs, ["position_ids"])
+        self.decoder_logits_name = self._must_find(self.decoder_io.outputs, ["logits"])
+
         self.decoder_cross_cache_names = self._find_cross_cache_names(self.decoder_io.inputs)
         self.decoder_uses_cross_cache = bool(self.decoder_cross_cache_names)
-        self.decoder_encoder_states_name = (
-            None if self.decoder_uses_cross_cache else self._find_decoder_encoder_states_name()
-        )
-        self.decoder_attention_mask_name = self._find_name(
-            self.decoder_io.inputs, ["decoder_attention_mask", "attention_mask"]
-        )
-        self.decoder_encoder_attention_mask_name = self._find_name(
-            self.decoder_io.inputs, ["encoder_attention_mask", "encoder_mask"]
-        )
-        self.decoder_position_ids_name = self._find_name(
-            self.decoder_io.inputs, ["position_ids", "positions"]
-        )
-        self.decoder_logits_name = self._find_decoder_logits_name()
 
-        self.past_input_names = [
-            node.name
-            for node in self.decoder_io.inputs
-            if "past" in node.name.lower() or "cache_self" in node.name.lower()
-        ]
-        self.present_output_names = [
-            node.name
-            for node in self.decoder_io.outputs
-            if "present" in node.name or "past" in node.name or "cache_self" in node.name
-        ]
-        self.has_kv_cache = bool(self.past_input_names and self.present_output_names)
+        # KV cache (self) in/out names
+        self.kv_self_in_names = [n.name for n in self.decoder_io.inputs if "cache_self" in n.name.lower() and n.name.lower().endswith("_in")]
+        self.kv_self_out_names = [n.name for n in self.decoder_io.outputs if "cache_self" in n.name.lower() and n.name.lower().endswith("_out")]
+        self.has_kv_cache = bool(self.kv_self_in_names and self.kv_self_out_names)
 
-        if self.debug:
-            print("Decoder KV-cache enabled:", self.has_kv_cache)
-            encoder_providers = self.encoder_session.get_providers()
-            decoder_providers = self.decoder_session.get_providers()
-            print("Selected providers (encoder):", encoder_providers)
-            print("Selected providers (decoder):", decoder_providers)
-            print("QNN selected (encoder):", "QNNExecutionProvider" in encoder_providers)
-            print("QNN selected (decoder):", "QNNExecutionProvider" in decoder_providers)
+        # Infer max positions + cache len from shapes
+        self.attn_max_len = int(self._get_input_shape_lastdim(self.decoder_attention_mask_name))  # 200
+        self.self_cache_len = int(self._get_any_self_cache_len())  # 199
 
         self.tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small")
 
+        if self.debug:
+            self.logger.info("Providers encoder: %s", self.encoder_session.get_providers())
+            self.logger.info("Providers decoder: %s", self.decoder_session.get_providers())
+            self.logger.info("attn_max_len=%d self_cache_len=%d has_kv_cache=%s",
+                             self.attn_max_len, self.self_cache_len, self.has_kv_cache)
+
+    # --------------------------
+    # Providers
+    # --------------------------
+    def _get_encoder_providers(self) -> list[str]:
+        if os.getenv("QNN_ENCODER_CPU", "").lower() in {"1", "true", "yes"}:
+            self.logger.warning("QNN encoder forced to CPUExecutionProvider for debugging.")
+            return ["CPUExecutionProvider"]
+        return ["QNNExecutionProvider", "CPUExecutionProvider"]
+
+    def _get_decoder_providers(self) -> list[str]:
+        if os.getenv("QNN_DECODER_CPU", "").lower() in {"1", "true", "yes"}:
+            self.logger.warning("QNN decoder forced to CPUExecutionProvider for debugging.")
+            return ["CPUExecutionProvider"]
+        return ["QNNExecutionProvider", "CPUExecutionProvider"]
+
+    # --------------------------
+    # Public debug
+    # --------------------------
     def dump_io(self) -> None:
-        """Print encoder/decoder IO metadata for debugging and adaptation."""
         print("\nEncoder inputs:")
         for node in self.encoder_io.inputs:
             print(f"  - {node.name}: shape={node.shape}, type={node.type}")
@@ -158,249 +155,291 @@ class WhisperSmallQuantizedQNNSTT:
         for node in self.decoder_io.outputs:
             print(f"  - {node.name}: shape={node.shape}, type={node.type}")
 
-    def _get_encoder_providers(self) -> list[str]:
-        if os.getenv("QNN_ENCODER_CPU", "").lower() in {"1", "true", "yes"}:
-            self.logger.warning("QNN encoder forced to CPUExecutionProvider for debugging.")
-            return ["CPUExecutionProvider"]
-        return ["QNNExecutionProvider"]
-
+    # --------------------------
+    # Transcription
+    # --------------------------
     def transcribe_wav(self, wav_path: Path, language: str | None = None) -> str:
-        """Transcribe a WAV file to text."""
         self.logger.info("Starting QNN transcription: %s (language=%s)", wav_path, language or "auto")
-        self.logger.info("Loading WAV file.")
+
         audio = self._load_wav_mono_16k(Path(wav_path))
         self.logger.info("WAV loaded. Samples=%d", audio.shape[0])
-        self.logger.info("Computing log-mel spectrogram.")
-        features = self._prepare_encoder_features(self._log_mel_spectrogram(audio))
-        self.logger.info("Encoder features ready. Shape=%s, dtype=%s", features.shape, features.dtype)
-        encoder_inputs = {self.encoder_input_name: features}
-        if self.encoder_outputs_are_cross_cache:
-            self.logger.info("Running encoder (cross-cache outputs).")
-            encoder_outputs = self.encoder_session.run(self.encoder_cross_cache_names, encoder_inputs)
-            encoder_hidden_states = None
-            encoder_cross_cache = {
-                name: value for name, value in zip(self.encoder_cross_cache_names, encoder_outputs)
-            }
-        else:
-            self.logger.info("Running encoder (hidden states output).")
-            encoder_outputs = self.encoder_session.run(
-                [self.encoder_output_name],
-                encoder_inputs,
-            )
-            encoder_hidden_states = encoder_outputs[0]
-            encoder_cross_cache = None
 
+        mel = self._log_mel_spectrogram(audio)               # [1,80,3000] float32
+        features = self._prepare_encoder_features(mel)       # uint16 expected
+        self.logger.info("Encoder features ready. Shape=%s, dtype=%s", features.shape, features.dtype)
+
+        # ----- encoder -> cross-cache outputs -----
+        enc_inputs = {self.encoder_input_name: features}
+        t0 = time.perf_counter()
+        enc_out = self.encoder_session.run(self.encoder_cross_cache_names, enc_inputs)
+        self.logger.info("Encoder run returned in %.3fs", time.perf_counter() - t0)
+        enc_cross_cache = {n: v for n, v in zip(self.encoder_cross_cache_names, enc_out)}
+
+        # ----- decoder prompt prefill (IMPORTANT) -----
         prompt_ids = self._build_prompt_ids(language)
+        if not prompt_ids:
+            raise RuntimeError("Prompt ids empty.")
+
+        # KV cache init
+        kv_cache = self._initialize_kv_cache() if self.has_kv_cache else {}
+
+        # Prefill each prompt token sequentially (because input_ids is [1,1])
+        # This warms the self-cache and produces logits for the next token.
+        logits = None
+        pos = 0
+        for tok in prompt_ids:
+            logits, kv_cache = self._decoder_step(
+                token_id=int(tok),
+                pos=pos,
+                kv_cache=kv_cache,
+                enc_cross_cache=enc_cross_cache,
+            )
+            pos += 1
+            if pos >= self.attn_max_len:
+                break
+
+        # Now generate new tokens
         input_ids: list[int] = prompt_ids.copy()
-        max_new_tokens = self._decoder_max_tokens(default=448)
-        eot_token = getattr(self.tokenizer, "eos_token_id", None)
-        if eot_token is None:
-            raise RuntimeError("Tokenizer does not define eos_token_id.")
+
+        eot_token = int(getattr(self.tokenizer, "eos_token_id", -1))
+        if eot_token < 0:
+            raise RuntimeError("Tokenizer eos_token_id missing.")
+
+        # Decide how many tokens we can still generate before hitting the 200 mask limit.
+        # positions are 0..attn_max_len-1
+        remaining_positions = max(0, (self.attn_max_len - pos))
+        max_new_tokens = min(200, remaining_positions)  # keep your 200, but never exceed max positions
 
         self.logger.info(
-            "Starting decoder loop. max_new_tokens=%d, has_kv_cache=%s",
-            max_new_tokens,
-            self.has_kv_cache,
+            "Decoder prefill done. pos=%d attn_max_len=%d -> max_new_tokens=%d",
+            pos, self.attn_max_len, max_new_tokens
         )
-        past_cache = self._initialize_past_cache() if self.has_kv_cache else None
-        cache_ready = False
+
+        # If last prefill produced logits, pick next token as first generated
         for step in range(max_new_tokens):
             if step % 10 == 0:
-                self.logger.info("Decoder step %d/%d", step + 1, max_new_tokens)
-            input_ids_to_feed = self._prepare_decoder_input_ids(input_ids, cache_ready)
-            decoder_inputs: dict[str, Any] = {
-                self.decoder_input_ids_name: np.array([input_ids_to_feed], dtype=np.int32),
-            }
-            if not self.decoder_uses_cross_cache:
-                if self.decoder_encoder_states_name is None:
-                    raise RuntimeError(self._format_io_error("decoder encoder states", self.decoder_io))
-                decoder_inputs[self.decoder_encoder_states_name] = encoder_hidden_states
-            else:
-                if encoder_cross_cache is None:
-                    raise RuntimeError(
-                        "Decoder expects cross-attention cache inputs, but encoder outputs are missing."
-                    )
-                decoder_inputs.update(encoder_cross_cache)
+                self.logger.info("Decoder gen step %d/%d", step + 1, max_new_tokens)
 
-            if self.decoder_attention_mask_name:
-                decoder_inputs[self.decoder_attention_mask_name] = self._build_decoder_attention_mask(
-                    self.decoder_attention_mask_name, step
-                )
-
-            if self.decoder_encoder_attention_mask_name:
-                if encoder_hidden_states is None:
-                    raise RuntimeError(
-                        "Decoder expects encoder attention mask, but encoder hidden states are missing."
-                    )
-                decoder_inputs[self.decoder_encoder_attention_mask_name] = np.ones(
-                    (encoder_hidden_states.shape[0], encoder_hidden_states.shape[1]),
-                    dtype=np.int64,
-                )
-
-            if self.decoder_position_ids_name:
-                decoder_inputs[self.decoder_position_ids_name] = np.array([step], dtype=np.int32)
-
-            if past_cache is not None:
-                decoder_inputs.update(past_cache)
-
-            self.logger.info("Running decoder session.")
-            outputs = self.decoder_session.run(None, decoder_inputs)
-            output_map = {node.name: value for node, value in zip(self.decoder_io.outputs, outputs)}
-
-            logits = output_map.get(self.decoder_logits_name)
             if logits is None:
-                raise RuntimeError(
-                    "Decoder outputs missing logits. "
-                    f"Got outputs: {[node.name for node in self.decoder_io.outputs]}"
+                # should not happen, but safety
+                logits, kv_cache = self._decoder_step(
+                    token_id=input_ids[-1],
+                    pos=pos,
+                    kv_cache=kv_cache,
+                    enc_cross_cache=enc_cross_cache,
                 )
-
-            next_token = self._select_next_token(logits)
+            next_token = int(self._select_next_token_from_logits(logits))
             input_ids.append(next_token)
-
-            if past_cache is not None:
-                past_cache = {
-                    name: output_map[name]
-                    for name in self.present_output_names
-                    if name in output_map
-                }
-                cache_ready = True
 
             if next_token == eot_token:
                 break
 
-        decoded = self.tokenizer.decode(input_ids, skip_special_tokens=True)
-        result = decoded.strip()
-        self.logger.info("Completed QNN transcription (chars=%d).", len(result))
-        return result
+            pos += 1
+            if pos >= self.attn_max_len:
+                break
 
+            logits, kv_cache = self._decoder_step(
+                token_id=next_token,
+                pos=pos,
+                kv_cache=kv_cache,
+                enc_cross_cache=enc_cross_cache,
+            )
+
+        decoded = self.tokenizer.decode(input_ids, skip_special_tokens=True).strip()
+        self.logger.info("Completed QNN transcription (chars=%d).", len(decoded))
+        return decoded
+
+    # --------------------------
+    # Decoder step helpers
+    # --------------------------
+    def _decoder_step(
+        self,
+        token_id: int,
+        pos: int,
+        kv_cache: dict[str, np.ndarray],
+        enc_cross_cache: dict[str, np.ndarray],
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Run ONE decoder call. The model expects input_ids [1,1], attention_mask [1,1,1,200], position_ids [1]."""
+        decoder_inputs: dict[str, Any] = {}
+
+        decoder_inputs[self.decoder_input_ids_name] = np.array([[token_id]], dtype=np.int32)
+
+        # attention_mask: [1,1,1,200] uint16
+        # Set allowed positions up to (pos) inclusive to 1, rest 0.
+        am_dtype = self._dtype_for_input(self.decoder_attention_mask_name, fallback=np.uint16)
+        attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=am_dtype)
+        upto = min(pos + 1, self.attn_max_len)
+        attn[0, 0, 0, :upto] = 1
+        decoder_inputs[self.decoder_attention_mask_name] = attn
+
+        # position_ids: [1] int32 (NOT [1,1])
+        pid_dtype = self._dtype_for_input(self.decoder_position_ids_name, fallback=np.int32)
+        decoder_inputs[self.decoder_position_ids_name] = np.array([pos], dtype=pid_dtype)
+
+        # KV cache in (self)
+        if self.has_kv_cache:
+            decoder_inputs.update(kv_cache)
+
+        # Cross cache in
+        if self.decoder_uses_cross_cache:
+            decoder_inputs.update(enc_cross_cache)
+
+        if self.debug:
+            self._log_decoder_inputs(decoder_inputs)
+
+        t0 = time.perf_counter()
+        outputs = self.decoder_session.run(None, decoder_inputs)
+        dt = time.perf_counter() - t0
+        self.logger.info("Decoder session.run() returned in %.3fs", dt)
+
+        output_map = {node.name: value for node, value in zip(self.decoder_io.outputs, outputs)}
+        logits = output_map[self.decoder_logits_name]
+
+        # Update KV cache from *_out
+        if self.has_kv_cache:
+            new_cache = {name.replace("_out", "_in"): output_map[name] for name in self.kv_self_out_names}
+        else:
+            new_cache = {}
+
+        return logits, new_cache
+
+    def _dtype_for_input(self, name: str, fallback=np.int64):
+        node = next((n for n in self.decoder_io.inputs if n.name == name), None)
+        if node is None or not node.type:
+            return fallback
+        t = node.type.lower()
+        if "uint16" in t:
+            return np.uint16
+        if "uint8" in t:
+            return np.uint8
+        if "int32" in t:
+            return np.int32
+        if "int64" in t:
+            return np.int64
+        if "float16" in t:
+            return np.float16
+        if "float" in t:
+            return np.float32
+        return fallback
+
+    def _select_next_token_from_logits(self, logits: np.ndarray) -> int:
+        # logits shape: [1, vocab, 1, 1] uint16
+        x = np.squeeze(logits)  # -> [vocab]
+        if x.ndim != 1:
+            x = x.reshape(-1)
+        return int(np.argmax(x))
+
+    # --------------------------
+    # IO discovery helpers
+    # --------------------------
+    def _must_find(self, nodes: Iterable[ort.NodeArg], candidates: list[str]) -> str:
+        name = self._find_name(nodes, candidates)
+        if name is None:
+            raise RuntimeError(f"Unable to find one of {candidates} in {[n.name for n in nodes]}")
+        return name
+
+    def _find_name(self, nodes: Iterable[ort.NodeArg], candidates: list[str]) -> str | None:
+        for cand in candidates:
+            for n in nodes:
+                if n.name.lower() == cand.lower():
+                    return n.name
+        for cand in candidates:
+            for n in nodes:
+                if cand.lower() in n.name.lower():
+                    return n.name
+        return None
+
+    def _find_cross_cache_names(self, nodes: Iterable[ort.NodeArg]) -> list[str]:
+        names: list[tuple[int, str]] = []
+        for node in nodes:
+            if "cache_cross" in node.name.lower():
+                names.append((self._extract_cache_index(node.name), node.name))
+        return [n for _, n in sorted(names, key=lambda x: x[0])]
+
+    def _extract_cache_index(self, name: str) -> int:
+        parts = name.split("_")
+        for p in reversed(parts):
+            if p.isdigit():
+                return int(p)
+        return 0
+
+    def _get_input_shape_lastdim(self, input_name: str) -> int:
+        node = next(n for n in self.decoder_io.inputs if n.name == input_name)
+        if not node.shape or not isinstance(node.shape[-1], int):
+            raise RuntimeError(f"Input {input_name} has non-static last dim: {node.shape}")
+        return int(node.shape[-1])
+
+    def _get_any_self_cache_len(self) -> int:
+        # use first self cache input to infer length (199)
+        for n in self.decoder_io.inputs:
+            if "cache_self" in n.name.lower() and n.name.lower().endswith("_in"):
+                if n.shape and isinstance(n.shape[-1], int):
+                    return int(n.shape[-1])
+        raise RuntimeError("Unable to infer self cache length from decoder inputs.")
+
+    # --------------------------
+    # Prompt + KV init
+    # --------------------------
+    def _build_prompt_ids(self, language: str | None) -> list[int]:
+        # WhisperTokenizer provides prompt ids
+        if hasattr(self.tokenizer, "get_decoder_prompt_ids"):
+            items = self.tokenizer.get_decoder_prompt_ids(language=language or "en", task="transcribe")
+            return [tid for _, tid in items]
+        bos = self.tokenizer.bos_token_id
+        if bos is None:
+            raise RuntimeError("Tokenizer has no bos_token_id.")
+        return [int(bos)]
+
+    def _initialize_kv_cache(self) -> dict[str, np.ndarray]:
+        cache: dict[str, np.ndarray] = {}
+        for node in self.decoder_io.inputs:
+            if node.name in self.kv_self_in_names:
+                shape = tuple(int(d) for d in node.shape)  # fully static
+                cache[node.name] = np.zeros(shape, dtype=self._numpy_dtype_from_ort(node.type))
+        return cache
+
+    def _numpy_dtype_from_ort(self, ort_type: str) -> np.dtype:
+        t = (ort_type or "").lower()
+        if "uint8" in t:
+            return np.uint8
+        if "uint16" in t:
+            return np.uint16
+        if "int32" in t:
+            return np.int32
+        if "int64" in t:
+            return np.int64
+        if "float16" in t:
+            return np.float16
+        if "float" in t:
+            return np.float32
+        return np.float32
+
+    # --------------------------
+    # Logging helpers
+    # --------------------------
+    def _brief_tensor(self, x: Any) -> str:
+        if not isinstance(x, np.ndarray):
+            return f"{type(x)}"
+        if x.size == 0:
+            return f"shape={x.shape} dtype={x.dtype} empty"
+        try:
+            return f"shape={x.shape} dtype={x.dtype} min={x.min()} max={x.max()}"
+        except Exception:
+            return f"shape={x.shape} dtype={x.dtype}"
+
+    def _log_decoder_inputs(self, decoder_inputs: dict[str, Any]) -> None:
+        for k, v in decoder_inputs.items():
+            self.logger.info("DEC IN %-40s %s", k, self._brief_tensor(v))
+
+    # --------------------------
+    # Audio + mel
+    # --------------------------
     def _validate_model_files(self, onnx_path: Path) -> None:
         if not onnx_path.exists():
             raise FileNotFoundError(f"Missing ONNX model: {onnx_path}")
         weights_path = onnx_path.with_suffix(".bin")
         if not weights_path.exists():
             raise FileNotFoundError(f"Missing external weights file: {weights_path}")
-
-    def _find_name(self, nodes: Iterable[ort.NodeArg], candidates: list[str]) -> str | None:
-        for candidate in candidates:
-            for node in nodes:
-                if node.name.lower() == candidate.lower():
-                    return node.name
-            for node in nodes:
-                if candidate.lower() in node.name.lower():
-                    return node.name
-        return None
-
-    def _find_encoder_input_name(self) -> str:
-        name = self._find_name(self.encoder_io.inputs, ["input_features", "input"])
-        if name is None:
-            raise RuntimeError(self._format_io_error("encoder input", self.encoder_io))
-        return name
-
-    def _find_encoder_output_name(self) -> str:
-        name = self._find_name(self.encoder_io.outputs, ["last_hidden_state", "hidden", "output"])
-        if name is None:
-            raise RuntimeError(self._format_io_error("encoder output", self.encoder_io))
-        return name
-
-    def _find_decoder_input_ids_name(self) -> str:
-        name = self._find_name(self.decoder_io.inputs, ["input_ids", "decoder_input_ids"])
-        if name is None:
-            raise RuntimeError(self._format_io_error("decoder input_ids", self.decoder_io))
-        return name
-
-    def _find_decoder_encoder_states_name(self) -> str:
-        name = self._find_name(self.decoder_io.inputs, ["encoder_hidden_states", "encoder_outputs"])
-        if name is None:
-            raise RuntimeError(self._format_io_error("decoder encoder states", self.decoder_io))
-        return name
-
-    def _find_decoder_logits_name(self) -> str:
-        name = self._find_name(self.decoder_io.outputs, ["logits", "logit"])
-        if name is None:
-            raise RuntimeError(self._format_io_error("decoder logits", self.decoder_io))
-        return name
-
-    def _find_cross_cache_names(self, nodes: Iterable[ort.NodeArg]) -> list[str]:
-        names: list[tuple[int, str]] = []
-        for node in nodes:
-            node_name = node.name.lower()
-            if "cache_cross" in node_name:
-                index = self._extract_cache_index(node.name)
-                names.append((index, node.name))
-        return [name for _, name in sorted(names, key=lambda item: item[0])]
-
-    def _extract_cache_index(self, name: str) -> int:
-        parts = name.split("_")
-        for part in reversed(parts):
-            if part.isdigit():
-                return int(part)
-        return 0
-
-    def _format_io_error(self, label: str, io_info: SessionIoInfo) -> str:
-        inputs = [node.name for node in io_info.inputs]
-        outputs = [node.name for node in io_info.outputs]
-        return (
-            f"Unable to find {label}. "
-            f"Inputs: {inputs}. Outputs: {outputs}. Call dump_io() to inspect."
-        )
-
-    def _build_prompt_ids(self, language: str | None) -> list[int]:
-        if hasattr(self.tokenizer, "get_decoder_prompt_ids"):
-            prompt_items = self.tokenizer.get_decoder_prompt_ids(
-                language=language or "en",
-                task="transcribe",
-            )
-            return [token_id for _, token_id in prompt_items]
-
-        bos = self.tokenizer.bos_token_id
-        if bos is None:
-            raise RuntimeError("Tokenizer does not define bos_token_id.")
-        return [bos]
-
-    def _initialize_past_cache(self) -> dict[str, np.ndarray]:
-        cache: dict[str, np.ndarray] = {}
-        for node in self.decoder_io.inputs:
-            if node.name not in self.past_input_names:
-                continue
-            shape = self._resolve_past_shape(node)
-            dtype = self._numpy_dtype_from_ort(node.type)
-            cache[node.name] = np.zeros(shape, dtype=dtype)
-        return cache
-
-    def _numpy_dtype_from_ort(self, ort_type: str) -> np.dtype:
-        ort_type = ort_type.lower()
-        if "uint8" in ort_type:
-            return np.uint8
-        if "uint16" in ort_type:
-            return np.uint16
-        if "int32" in ort_type:
-            return np.int32
-        if "float16" in ort_type:
-            return np.float16
-        return np.float32
-
-    def _resolve_past_shape(self, node: ort.NodeArg) -> tuple[int, ...]:
-        if node.shape is None:
-            raise RuntimeError(
-                "Unable to resolve past_key_values shape; check decoder IO with dump_io()."
-            )
-        resolved_shape: list[int] = []
-        for dim in node.shape:
-            if isinstance(dim, int) and dim > 0:
-                resolved_shape.append(dim)
-                continue
-            dim_label = str(dim).lower()
-            if "batch" in dim_label:
-                resolved_shape.append(1)
-            elif "seq" in dim_label or "past" in dim_label:
-                resolved_shape.append(0)
-            else:
-                resolved_shape.append(1)
-        if not resolved_shape:
-            raise RuntimeError(
-                "Unable to resolve past_key_values shape; check decoder IO with dump_io()."
-            )
-        return tuple(resolved_shape)
 
     def _load_wav_mono_16k(self, wav_path: Path) -> np.ndarray:
         with wave.open(str(wav_path), "rb") as wav_file:
@@ -461,57 +500,24 @@ class WhisperSmallQuantizedQNNSTT:
         mel_spec = torch.maximum(mel_spec, mel_spec.max() - 8.0)
         mel_spec = (mel_spec + 4.0) / 4.0
 
+        # Force frames to 3000 (matches encoder input)
+        target_frames = 3000
+        T = int(mel_spec.shape[-1])
+        if T < target_frames:
+            mel_spec = torch.nn.functional.pad(mel_spec, (0, target_frames - T))
+        else:
+            mel_spec = mel_spec[:, :target_frames]
+
         return mel_spec.unsqueeze(0).numpy().astype(np.float32)
 
     def _prepare_encoder_features(self, features: np.ndarray) -> np.ndarray:
-        encoder_input = self.encoder_io.inputs[0]
-        dtype = self._numpy_dtype_from_ort(encoder_input.type)
-        if dtype == np.uint16:
+        # encoder expects uint16
+        node = self.encoder_io.inputs[0]
+        t = (node.type or "").lower()
+        if "uint16" in t:
             scaled = np.clip(features * 65535.0, 0, 65535)
             return scaled.astype(np.uint16)
-        return features.astype(dtype)
-
-    def _build_decoder_attention_mask(self, name: str, step: int) -> np.ndarray:
-        node = next(node for node in self.decoder_io.inputs if node.name == name)
-        shape = node.shape or [1, 1, 1, len(self.tokenizer)]
-        resolved: list[int] = []
-        for dim in shape:
-            if isinstance(dim, int) and dim > 0:
-                resolved.append(dim)
-            else:
-                resolved.append(1)
-        mask = np.zeros(tuple(resolved), dtype=self._numpy_dtype_from_ort(node.type))
-        if resolved:
-            max_len = resolved[-1]
-            active = min(step + 1, max_len)
-            mask[..., :active] = 1
-        return mask
-
-    def _decoder_max_tokens(self, default: int) -> int:
-        if not self.decoder_attention_mask_name:
-            return default
-        node = next(node for node in self.decoder_io.inputs if node.name == self.decoder_attention_mask_name)
-        shape = node.shape or []
-        if shape and isinstance(shape[-1], int) and shape[-1] > 0:
-            return shape[-1]
-        return default
-
-    def _prepare_decoder_input_ids(self, input_ids: list[int], cache_ready: bool) -> list[int]:
-        node = next(node for node in self.decoder_io.inputs if node.name == self.decoder_input_ids_name)
-        shape = node.shape or []
-        if shape and isinstance(shape[-1], int) and shape[-1] == 1:
-            return [input_ids[-1]]
-        if cache_ready:
-            return [input_ids[-1]]
-        return input_ids
-
-    def _select_next_token(self, logits: np.ndarray) -> int:
-        squeezed = np.squeeze(logits)
-        if squeezed.ndim == 1:
-            return int(np.argmax(squeezed))
-        if squeezed.ndim == 2:
-            return int(np.argmax(squeezed[-1]))
-        return int(np.argmax(squeezed.reshape(squeezed.shape[0], -1)[-1]))
+        return features.astype(np.float32)
 
     def _mel_filterbank(self, n_mels: int, n_fft: int, sample_rate: int) -> torch.Tensor:
         def hz_to_mel(freq: float) -> float:
@@ -530,12 +536,8 @@ class WhisperSmallQuantizedQNNSTT:
         for i in range(1, n_mels + 1):
             start, center, end = bin_frequencies[i - 1 : i + 2]
             if center > start:
-                filter_bank[i - 1, start:center] = (
-                    np.arange(start, center) - start
-                ) / (center - start)
+                filter_bank[i - 1, start:center] = (np.arange(start, center) - start) / (center - start)
             if end > center:
-                filter_bank[i - 1, center:end] = (
-                    end - np.arange(center, end)
-                ) / (end - center)
+                filter_bank[i - 1, center:end] = (end - np.arange(center, end)) / (end - center)
 
         return torch.from_numpy(filter_bank).float()
