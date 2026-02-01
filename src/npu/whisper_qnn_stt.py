@@ -205,6 +205,52 @@ class WhisperSmallQuantizedQNNSTT:
         if eot_token < 0:
             raise RuntimeError("Tokenizer eos_token_id missing.")
 
+        # pos currently == len(prompt_ids)  (next position index to be generated)
+        remaining_positions = max(0, (self.attn_max_len - pos))
+        max_new_tokens = min(200, remaining_positions)
+
+        self.logger.info(
+            "Decoder prefill done. pos=%d attn_max_len=%d -> max_new_tokens=%d",
+            pos, self.attn_max_len, max_new_tokens
+        )
+
+        # We already have logits from the last prefill step (unless prompt was empty)
+        for step in range(max_new_tokens):
+            if step % 10 == 0:
+                self.logger.info("Decoder gen step %d/%d", step + 1, max_new_tokens)
+
+            if logits is None:
+                # Safety: compute logits for "next token" from last known token at previous position
+                last_tok = input_ids[-1]
+                logits, kv_cache = self._decoder_step(
+                    token_id=int(last_tok),
+                    pos=max(0, pos - 1),
+                    kv_cache=kv_cache,
+                    enc_cross_cache=enc_cross_cache,
+                )
+
+            next_token = int(self._select_next_token_from_logits(logits))
+
+            # If model ends immediately, stop.
+            if next_token == eot_token:
+                input_ids.append(next_token)
+                break
+
+            # IMPORTANT: next_token belongs to CURRENT pos
+            input_ids.append(next_token)
+
+            logits, kv_cache = self._decoder_step(
+                token_id=next_token,
+                pos=pos,  # <-- correct position for this token
+                kv_cache=kv_cache,
+                enc_cross_cache=enc_cross_cache,
+            )
+
+            pos += 1
+            if pos >= self.attn_max_len:
+                break
+
+
         # Decide how many tokens we can still generate before hitting the 200 mask limit.
         # positions are 0..attn_max_len-1
         remaining_positions = max(0, (self.attn_max_len - pos))
@@ -245,7 +291,11 @@ class WhisperSmallQuantizedQNNSTT:
                 enc_cross_cache=enc_cross_cache,
             )
 
+        decoded_raw = self.tokenizer.decode(input_ids, skip_special_tokens=False).strip()
         decoded = self.tokenizer.decode(input_ids, skip_special_tokens=True).strip()
+
+        self.logger.info("DECODE (no-skip)='%s'", decoded_raw[:200])
+        self.logger.info("DECODE (skip)='%s'", decoded[:200])
         self.logger.info("Completed QNN transcription (chars=%d).", len(decoded))
         return decoded
 
@@ -381,14 +431,23 @@ class WhisperSmallQuantizedQNNSTT:
     # Prompt + KV init
     # --------------------------
     def _build_prompt_ids(self, language: str | None) -> list[int]:
-        # WhisperTokenizer provides prompt ids
-        if hasattr(self.tokenizer, "get_decoder_prompt_ids"):
-            items = self.tokenizer.get_decoder_prompt_ids(language=language or "en", task="transcribe")
-            return [tid for _, tid in items]
+        lang = (language or "en").lower()
+
+        # BOS for Whisper is <|startoftranscript|>
         bos = self.tokenizer.bos_token_id
         if bos is None:
-            raise RuntimeError("Tokenizer has no bos_token_id.")
+            bos = self.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+        if bos is None:
+            raise RuntimeError("Cannot resolve <|startoftranscript|> token id.")
+
+        # WhisperTokenizer gives the rest (lang/task/notimestamps)
+        if hasattr(self.tokenizer, "get_decoder_prompt_ids"):
+            items = self.tokenizer.get_decoder_prompt_ids(language=lang, task="transcribe")
+            rest = [int(tid) for _, tid in items]
+            return [int(bos)] + rest
+
         return [int(bos)]
+
 
     def _initialize_kv_cache(self) -> dict[str, np.ndarray]:
         cache: dict[str, np.ndarray] = {}

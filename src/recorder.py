@@ -136,8 +136,8 @@ class AudioRecorder:
         # Components
         self.mic_selector = MicrophoneSelector()
         self.silence_detector = SilenceDetector(
-            silence_threshold=500, 
-            silence_duration=1.0,
+            silence_threshold=350, 
+            silence_duration=1.5,
             sample_rate=self.sample_rate
         )
         
