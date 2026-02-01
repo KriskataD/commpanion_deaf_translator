@@ -176,6 +176,11 @@ class TranslatorPipeline:
             self.last_audio_path.unlink()
         self.last_audio_path = None
 
+    def delete_last_audio_file(self) -> None:
+        if self.last_audio_path and self.last_audio_path.exists():
+            self.last_audio_path.unlink()
+        self.last_audio_path = None
+
     def set_languages(self, source_lang: str, target_lang: str) -> None:
         """Update the language pair for subsequent translations."""
         self.source_lang = source_lang
@@ -205,11 +210,21 @@ class TranslatorPipeline:
             return ""
 
         print("📝 Transcribing...")
-        transcription = self.transcribe()
+        try:
+            transcription = self.transcribe()
+        except Exception as exc:
+            self.logger.exception("Transcription failed.")
+            print(f"❌ Transcription failed: {exc}")
+            return ""
         print(f"Original text ({self.source_lang}): {transcription}")
 
         print("🌐 Translating...")
-        return self.translate_transcription(transcription)
+        try:
+            return self.translate_transcription(transcription)
+        except Exception as exc:
+            self.logger.exception("Translation failed.")
+            print(f"❌ Translation failed: {exc}")
+            return ""
 
     def run_loop(self) -> None:
         """Continuously record, translate, and optionally speak until interrupted."""
@@ -238,6 +253,7 @@ def _print_language_list(translator: MultiLanguageTranslator) -> None:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(description="Speech translator using QNN Whisper STT and M2M100.")
     parser.add_argument("--source-lang", default="en", help="Source language code (e.g., en, fr, es).")
     parser.add_argument("--target-lang", default="fr", help="Target language code (e.g., fr, en, de).")
