@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import os
 from pathlib import Path
 from typing import Any, Iterable
 import wave
@@ -76,7 +77,10 @@ class WhisperSmallQuantizedQNNSTT:
         self._validate_model_files(self.decoder_onnx)
 
         try:
-            self.encoder_session = make_session(self.encoder_onnx)
+            self.encoder_session = make_session(
+                self.encoder_onnx,
+                providers=self._get_encoder_providers(),
+            )
             self.decoder_session = make_session(self.decoder_onnx)
         except Exception:
             self.logger.exception("Failed to create QNN ONNX Runtime sessions.")
@@ -153,6 +157,12 @@ class WhisperSmallQuantizedQNNSTT:
         print("Decoder outputs:")
         for node in self.decoder_io.outputs:
             print(f"  - {node.name}: shape={node.shape}, type={node.type}")
+
+    def _get_encoder_providers(self) -> list[str]:
+        if os.getenv("QNN_ENCODER_CPU", "").lower() in {"1", "true", "yes"}:
+            self.logger.warning("QNN encoder forced to CPUExecutionProvider for debugging.")
+            return ["CPUExecutionProvider"]
+        return ["QNNExecutionProvider"]
 
     def transcribe_wav(self, wav_path: Path, language: str | None = None) -> str:
         """Transcribe a WAV file to text."""
