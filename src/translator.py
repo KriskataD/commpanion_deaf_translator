@@ -11,6 +11,7 @@ import concurrent.futures
 import logging
 import threading
 import time
+import os
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -131,19 +132,43 @@ class TranslatorPipeline:
                 self.delete_last_audio_file()
 
     def _build_stt_backend(self, qnn_encoder_dir: str | Path, qnn_decoder_dir: str | Path):
-        encoder_dir = Path(qnn_encoder_dir)
-        decoder_dir = Path(qnn_decoder_dir)
-        if not encoder_dir.exists() or not decoder_dir.exists():
-            raise FileNotFoundError(
-                "QNN Whisper model directories not found. "
-                f"Encoder: {encoder_dir} | Decoder: {decoder_dir}"
-            )
+        encoder_dir, decoder_dir = self._resolve_qnn_model_dirs(qnn_encoder_dir, qnn_decoder_dir)
         self.logger.info("QNN encoder directory: %s", encoder_dir)
         self.logger.info("QNN decoder directory: %s", decoder_dir)
         return WhisperSmallQuantizedQNNSTT(
             encoder_dir=encoder_dir,
             decoder_dir=decoder_dir,
             debug=False,
+        )
+
+    def _resolve_qnn_model_dirs(
+        self,
+        qnn_encoder_dir: str | Path,
+        qnn_decoder_dir: str | Path,
+    ) -> tuple[Path, Path]:
+        env_encoder = os.getenv("QNN_ENCODER_DIR")
+        env_decoder = os.getenv("QNN_DECODER_DIR")
+
+        base_dir = Path(__file__).resolve().parent
+        candidates = [
+            (Path(qnn_encoder_dir), Path(qnn_decoder_dir)),
+            (Path(qnn_encoder_dir).expanduser(), Path(qnn_decoder_dir).expanduser()),
+            (base_dir / qnn_encoder_dir, base_dir / qnn_decoder_dir),
+            (base_dir.parent / qnn_encoder_dir, base_dir.parent / qnn_decoder_dir),
+        ]
+
+        if env_encoder and env_decoder:
+            candidates.insert(0, (Path(env_encoder), Path(env_decoder)))
+
+        for encoder_dir, decoder_dir in candidates:
+            if encoder_dir.exists() and decoder_dir.exists():
+                return encoder_dir, decoder_dir
+
+        attempted = " | ".join(f"{enc} / {dec}" for enc, dec in candidates)
+        raise FileNotFoundError(
+            "QNN Whisper model directories not found. "
+            "Set --qnn-encoder-dir/--qnn-decoder-dir or QNN_ENCODER_DIR/QNN_DECODER_DIR. "
+            f"Attempted: {attempted}"
         )
 
     def delete_last_audio_file(self) -> None:
@@ -220,12 +245,12 @@ def main() -> None:
     parser.add_argument(
         "--qnn-encoder-dir",
         default="models/whisper_small_quantized_encoder_optimized_onnx",
-        help="Directory containing the QNN Whisper encoder ONNX model.",
+        help="Directory containing the QNN Whisper encoder ONNX model (or set QNN_ENCODER_DIR).",
     )
     parser.add_argument(
         "--qnn-decoder-dir",
         default="models/whisper_small_quantized_decoder_optimized_onnx",
-        help="Directory containing the QNN Whisper decoder ONNX model.",
+        help="Directory containing the QNN Whisper decoder ONNX model (or set QNN_DECODER_DIR).",
     )
     parser.add_argument(
         "--stt-timeout",

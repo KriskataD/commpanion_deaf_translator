@@ -15,7 +15,8 @@ Wake-word controlled pipeline that records speech, transcribes it with QNN Whisp
 1) Python 3.10+ recommended.  
 2) Install deps: `pip install -r requirements.txt` (PyAudio may need OS-specific tooling).
 3) Models:
-   - QNN Whisper: export the quantized encoder/decoder ONNX models and set the directories with `--qnn-encoder-dir` and `--qnn-decoder-dir`.
+   - QNN Whisper: export the quantized encoder/decoder ONNX models and set the directories with
+     `--qnn-encoder-dir`/`--qnn-decoder-dir` or the `QNN_ENCODER_DIR`/`QNN_DECODER_DIR` environment variables.
    - Wake word: `openwakeword` downloads defaults on first run; to use a custom model, place it in `src/models/` and pass `--wakeword path/to/model.onnx`.
    - YOLO: download a YOLOv8 weights file (e.g., `yolov8l-oiv7.pt`) into `src/models/` and update `src/yolov8Objects.py` if you want to run it.
 

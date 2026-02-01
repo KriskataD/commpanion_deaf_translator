@@ -346,12 +346,12 @@ def main() -> None:
     parser.add_argument(
         "--qnn-encoder-dir",
         default="models/whisper_small_quantized_encoder_optimized_onnx",
-        help="Directory containing the QNN Whisper encoder ONNX model.",
+        help="Directory containing the QNN Whisper encoder ONNX model (or set QNN_ENCODER_DIR).",
     )
     parser.add_argument(
         "--qnn-decoder-dir",
         default="models/whisper_small_quantized_decoder_optimized_onnx",
-        help="Directory containing the QNN Whisper decoder ONNX model.",
+        help="Directory containing the QNN Whisper decoder ONNX model (or set QNN_DECODER_DIR).",
     )
     parser.add_argument(
         "--wakeword",
