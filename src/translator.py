@@ -138,7 +138,7 @@ class TranslatorPipeline:
         return WhisperSmallQuantizedQNNSTT(
             encoder_dir=encoder_dir,
             decoder_dir=decoder_dir,
-            debug=False,
+            debug=True,
         )
 
     def _resolve_qnn_model_dirs(

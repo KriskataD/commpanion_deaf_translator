@@ -12,7 +12,7 @@ import time
 import numpy as np
 import onnxruntime as ort
 import torch
-from transformers import WhisperTokenizer
+from transformers import WhisperTokenizer, WhisperConfig
 
 from .ort_qnn import make_session
 
@@ -115,6 +115,8 @@ class WhisperSmallQuantizedQNNSTT:
         self.self_cache_len = int(self._get_any_self_cache_len())  # 199
 
         self.tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small")
+        self.config = WhisperConfig.from_pretrained("openai/whisper-small")
+        self.suppress_tokens = set(self.config.suppress_tokens or [])
 
         if self.debug:
             self.logger.info("Providers encoder: %s", self.encoder_session.get_providers())
@@ -373,11 +375,24 @@ class WhisperSmallQuantizedQNNSTT:
         return fallback
 
     def _select_next_token_from_logits(self, logits: np.ndarray) -> int:
-        # logits shape: [1, vocab, 1, 1] uint16
-        x = np.squeeze(logits)  # -> [vocab]
+        x = np.squeeze(logits)
         if x.ndim != 1:
             x = x.reshape(-1)
-        return int(np.argmax(x))
+
+        # Interpret output as signed if model exported logits as uint16 container
+        if x.dtype == np.uint16:
+            x = x.view(np.int16)
+
+        # Work in int32 so we can set a very negative value safely
+        scores = x.astype(np.int32)
+
+        # Suppress Whisper control/special tokens (HF does this internally)
+        if getattr(self, "suppress_tokens", None):
+            for tid in self.suppress_tokens:
+                if 0 <= tid < scores.shape[0]:
+                    scores[tid] = -10**9
+
+        return int(np.argmax(scores))
 
     # --------------------------
     # IO discovery helpers
