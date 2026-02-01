@@ -11,3 +11,5 @@ export_assets/
 src/models/
 
 audio/
+
+.vscode/
