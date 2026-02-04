@@ -206,7 +206,7 @@ class TranslatorPipeline:
 
         print("📝 Transcribing...")
         try:
-            transcription = self.transcribe(language_override=self.source_lang)
+            transcription = self.transcribe(language_override=self.source_lang, delete=False)
         except Exception as exc:
             self.logger.exception("Transcription failed.")
             print(f"❌ Transcription failed: {exc}")

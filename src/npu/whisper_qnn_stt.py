@@ -239,6 +239,8 @@ class WhisperSmallQuantizedQNNSTT:
             pos, self.attn_max_len, max_new_tokens
         )
 
+        self._block_eot_steps = 8   # Fix 4: block EOS/EOT for first N generation selections
+
         # We already have logits from the last prefill step (unless prompt was empty)
         for step in range(max_new_tokens):
             if step % 10 == 0:
@@ -309,9 +311,9 @@ class WhisperSmallQuantizedQNNSTT:
 
         if attn.dtype == np.uint16:
             one_u16 = np.array([1.0], dtype=np.float16).view(np.uint16)[0]
-            attn[0, 0, 0, -count:] = one_u16   # ✅ right-aligned
+            attn[0, 0, 0, :count] = one_u16   # ✅ left-aligned
         else:
-            attn[0, 0, 0, -count:] = 1         # ✅ right-aligned
+            attn[0, 0, 0, :count] = 1         # ✅ left-aligned
 
 
         # --- sanity check (only when debug=True) ---
@@ -367,7 +369,6 @@ class WhisperSmallQuantizedQNNSTT:
             # Also print which one you're currently treating as logits
             self.logger.info("Configured decoder_logits_name = %s", self.decoder_logits_name)
 
-
         dt = time.perf_counter() - t0
         self.logger.info("Decoder session.run() returned in %.3fs", dt)
 
@@ -380,6 +381,34 @@ class WhisperSmallQuantizedQNNSTT:
                 "Selected logits tensor shape=%s dtype=%s squeezed_shape=%s squeezed_size=%d",
                 logits.shape, logits.dtype, squeezed.shape, squeezed.size
             )
+
+            # logits_u16 should be shape (vocab_size,) and dtype uint16 at this point
+            logits_u16 = logits.squeeze()
+
+            # Ensure contiguous before view/debug
+            logits_u16 = np.ascontiguousarray(logits_u16)
+
+            # Compare token selection if you interpret the buffer two different ways
+            arg_u16 = int(np.argmax(logits_u16))
+            arg_fp16_view = int(np.argmax(logits_u16.view(np.float16)))
+
+            self.logger.info(f"ARGMAX compare: u16={arg_u16}, fp16_view={arg_fp16_view}")
+
+            # Show top-5 both ways (debug only)
+            top_u16 = np.argsort(logits_u16)[-5:][::-1]
+            top_fp16 = np.argsort(logits_u16.view(np.float16))[-5:][::-1]
+
+            self.logger.info(f"Top-5 (u16) ids: {top_u16.tolist()}")
+            self.logger.info(f"Top-5 (fp16_view) ids: {top_fp16.tolist()}")
+
+            # If you have a tokenizer object in scope:
+            try:
+                self.logger.info(f"Top-5 (u16) toks: {[self.tokenizer.decode([int(i)]) for i in top_u16]}")
+                self.logger.info(f"Top-5 (fp16_view) toks: {[self.tokenizer.decode([int(i)]) for i in top_fp16]}")
+            except Exception:
+                pass
+
+
             # ✅ For this exported model, vocab is NOT the last dim; use squeezed size check instead.
             if squeezed.size != 51865:
                 self.logger.warning(
@@ -423,12 +452,23 @@ class WhisperSmallQuantizedQNNSTT:
 
         # QNN often returns fp16 packed as uint16 bits
         if x.dtype == np.uint16:
-            # Interpret as float16 bit-patterns (NOT int16)
-            x = x.view(np.float16).astype(np.float32)
-            scores = x
+            x_u16 = np.ascontiguousarray(x)
+            x_fp16 = x_u16.view(np.float16)
+
+            # If packed-fp16 is wrong, it often produces NaNs/Infs or nonsense
+            if np.isnan(x_fp16).any() or np.isinf(x_fp16).any():
+                scores = x_u16.astype(np.float32)  # fallback: treat as monotonic u16 scores
+            else:
+                scores = x_fp16.astype(np.float32)
         else:
-            # Normal case
             scores = x.astype(np.float32)
+
+
+        eot = int(getattr(self.tokenizer, "eos_token_id", -1))
+        if getattr(self, "_block_eot_steps", 0) > 0 and 0 <= eot < scores.shape[0]:
+            scores[eot] = -1e9
+            self._block_eot_steps -= 1
+
 
         # Suppress Whisper control/special tokens
         if getattr(self, "suppress_tokens", None):
@@ -526,7 +566,12 @@ class WhisperSmallQuantizedQNNSTT:
         for node in self.decoder_io.inputs:
             if node.name in self.kv_self_in_names:
                 shape = tuple(int(d) for d in node.shape)  # fully static
-                cache[node.name] = np.zeros(shape, dtype=self._numpy_dtype_from_ort(node.type))
+                #cache[node.name] = np.zeros(shape, dtype=self._numpy_dtype_from_ort(node.type))
+                dtype = self._numpy_dtype_from_ort(node.type)
+                if dtype == np.uint8:
+                    cache[node.name] = np.full(shape, 128, dtype=np.uint8)  # ✅ common zero-point
+                else:
+                    cache[node.name] = np.zeros(shape, dtype=dtype)
         return cache
 
     def _numpy_dtype_from_ort(self, ort_type: str) -> np.dtype:
