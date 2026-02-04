@@ -310,10 +310,11 @@ class WhisperSmallQuantizedQNNSTT:
         count = min(pos + 1, self.attn_max_len)
 
         if attn.dtype == np.uint16:
-            one_u16 = np.array([1.0], dtype=np.float16).view(np.uint16)[0]
-            attn[0, 0, 0, :count] = one_u16   # ✅ left-aligned
+            #one_u16 = np.array([1.0], dtype=np.float16).view(np.uint16)[0]
+            #attn[0, 0, 0, -count:] = one_u16   # ✅ right-aligned
+            attn[0, 0, 0, -count:] = np.uint16(1)
         else:
-            attn[0, 0, 0, :count] = 1         # ✅ left-aligned
+            attn[0, 0, 0, -count:] = 1         # ✅ right-aligned
 
 
         # --- sanity check (only when debug=True) ---
