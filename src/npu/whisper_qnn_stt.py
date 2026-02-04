@@ -175,8 +175,17 @@ class WhisperSmallQuantizedQNNSTT:
         audio = self._load_wav_mono_16k(Path(wav_path))
         self.logger.info("WAV loaded. Samples=%d", audio.shape[0])
 
+        # After loading audio as float32 in [-1, 1]
+        rms = float(np.sqrt(np.mean(audio**2)) + 1e-12)
+        peak = float(np.max(np.abs(audio)) + 1e-12)
+        self.logger.info("Audio stats: duration=%.2fs rms=%.6f peak=%.6f",
+                        len(audio)/16000.0, rms, peak)
+
+
         mel = self._log_mel_spectrogram(audio)               # [1,80,3000] float32
         features = self._prepare_encoder_features(mel)       # uint16 expected
+        if self.debug:
+            self.logger.info("Encoder features min=%s max=%s", int(features.min()), int(features.max()))
         self.logger.info("Encoder features ready. Shape=%s, dtype=%s", features.shape, features.dtype)
 
         # ----- encoder -> cross-cache outputs -----
@@ -616,12 +625,16 @@ class WhisperSmallQuantizedQNNSTT:
         return mel_spec.unsqueeze(0).numpy().astype(np.float32)
 
     def _prepare_encoder_features(self, features: np.ndarray) -> np.ndarray:
-        # encoder expects uint16
+        # encoder expects uint16, but it's very likely float16 bit-patterns packed into uint16
         node = self.encoder_io.inputs[0]
         t = (node.type or "").lower()
+
         if "uint16" in t:
-            scaled = np.clip(features * 65535.0, 0, 65535)
-            return scaled.astype(np.uint16)
+            # ✅ pack float16 bits into uint16 (same idea as your logits handling)
+            packed = features.astype(np.float16).view(np.uint16)
+            return packed
+
+        # fallback
         return features.astype(np.float32)
 
     def _mel_filterbank(self, n_mels: int, n_fft: int, sample_rate: int) -> torch.Tensor:
