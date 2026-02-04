@@ -12,7 +12,7 @@ import time
 import numpy as np
 import onnxruntime as ort
 import torch
-from transformers import WhisperTokenizer, WhisperConfig
+from transformers import WhisperTokenizer, WhisperConfig, WhisperFeatureExtractor
 
 from .ort_qnn import make_session
 
@@ -98,6 +98,7 @@ class WhisperSmallQuantizedQNNSTT:
             for node in self.decoder_io.outputs:
                 self.logger.info("OUT %-35s shape=%s type=%s", node.name, node.shape, node.type)
 
+        self.feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small")
 
         # Names from IO
         self.encoder_input_name = self._must_find(self.encoder_io.inputs, ["input_features"])
@@ -301,12 +302,28 @@ class WhisperSmallQuantizedQNNSTT:
         decoder_inputs[self.decoder_input_ids_name] = np.array([[token_id]], dtype=np.int32)
 
         # attention_mask: [1,1,1,200] uint16
-        # Set allowed positions up to (pos) inclusive to 1, rest 0.
+        # Some QNN-exported models expect float16 values *bit-packed* into uint16.
         am_dtype = self._dtype_for_input(self.decoder_attention_mask_name, fallback=np.uint16)
         attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=am_dtype)
-        upto = min(pos + 1, self.attn_max_len)
-        attn[0, 0, 0, :upto] = 1
+        count = min(pos + 1, self.attn_max_len)
+
+        if attn.dtype == np.uint16:
+            one_u16 = np.array([1.0], dtype=np.float16).view(np.uint16)[0]
+            attn[0, 0, 0, -count:] = one_u16   # ✅ right-aligned
+        else:
+            attn[0, 0, 0, -count:] = 1         # ✅ right-aligned
+
+
+        # --- sanity check (only when debug=True) ---
+        if self.debug and attn.dtype == np.uint16:
+            flat = attn.reshape(-1)
+            self.logger.info("ATTN first 12 (u16): %s", flat[:12].tolist())
+            self.logger.info("ATTN last  12 (u16): %s", flat[-12:].tolist())
+            self.logger.info("ATTN first 12 (fp16): %s", flat[:12].view(np.float16).tolist())
+            self.logger.info("ATTN last  12 (fp16): %s", flat[-12:].view(np.float16).tolist())
+
         decoder_inputs[self.decoder_attention_mask_name] = attn
+
 
         # position_ids: [1] int32 (NOT [1,1])
         pid_dtype = self._dtype_for_input(self.decoder_position_ids_name, fallback=np.int32)
@@ -584,45 +601,12 @@ class WhisperSmallQuantizedQNNSTT:
         return np.interp(target_indices, source_indices, audio).astype(np.float32)
 
     def _log_mel_spectrogram(self, audio: np.ndarray) -> np.ndarray:
-        n_fft = 400
-        hop_length = 160
-        win_length = 400
-        n_mels = 80
-        max_samples = 16000 * 30
-
-        if audio.shape[0] < max_samples:
-            audio = np.pad(audio, (0, max_samples - audio.shape[0]))
-        else:
-            audio = audio[:max_samples]
-
-        audio_tensor = torch.from_numpy(audio)
-        window = torch.hann_window(win_length)
-        stft = torch.stft(
-            audio_tensor,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            win_length=win_length,
-            window=window,
-            center=True,
-            return_complex=True,
-        )
-        magnitudes = stft.abs().pow(2.0)
-
-        mel_filters = self._mel_filterbank(n_mels=n_mels, n_fft=n_fft, sample_rate=16000)
-        mel_spec = torch.matmul(mel_filters, magnitudes)
-        mel_spec = torch.clamp(mel_spec, min=1e-10).log10()
-        mel_spec = torch.maximum(mel_spec, mel_spec.max() - 8.0)
-        mel_spec = (mel_spec + 4.0) / 4.0
-
-        # Force frames to 3000 (matches encoder input)
-        target_frames = 3000
-        T = int(mel_spec.shape[-1])
-        if T < target_frames:
-            mel_spec = torch.nn.functional.pad(mel_spec, (0, target_frames - T))
-        else:
-            mel_spec = mel_spec[:, :target_frames]
-
-        return mel_spec.unsqueeze(0).numpy().astype(np.float32)
+        feats = self.feature_extractor(
+            audio,
+            sampling_rate=16000,
+            return_tensors="np"
+        ).input_features  # float32, shape (1, 80, 3000)
+        return feats.astype(np.float32)
 
     def _prepare_encoder_features(self, features: np.ndarray) -> np.ndarray:
         # encoder expects uint16, but it's very likely float16 bit-patterns packed into uint16
