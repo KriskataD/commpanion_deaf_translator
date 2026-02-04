@@ -93,6 +93,12 @@ class WhisperSmallQuantizedQNNSTT:
             outputs=self.decoder_session.get_outputs(),
         )
 
+        if self.debug:
+            self.logger.info("=== Decoder outputs declared by ONNX (get_outputs) ===")
+            for node in self.decoder_io.outputs:
+                self.logger.info("OUT %-35s shape=%s type=%s", node.name, node.shape, node.type)
+
+
         # Names from IO
         self.encoder_input_name = self._must_find(self.encoder_io.inputs, ["input_features"])
         self.encoder_cross_cache_names = self._find_cross_cache_names(self.encoder_io.outputs)
@@ -182,6 +188,10 @@ class WhisperSmallQuantizedQNNSTT:
 
         # ----- decoder prompt prefill (IMPORTANT) -----
         prompt_ids = self._build_prompt_ids(language)
+        if self.debug:
+            self.logger.info("Prompt ids: %s", prompt_ids)
+            self.logger.info("Prompt tokens: %s", self.tokenizer.decode(prompt_ids, skip_special_tokens=False))
+
         if not prompt_ids:
             raise RuntimeError("Prompt ids empty.")
 
@@ -306,11 +316,50 @@ class WhisperSmallQuantizedQNNSTT:
 
         t0 = time.perf_counter()
         outputs = self.decoder_session.run(None, decoder_inputs)
+
+        # --- One-time: dump runtime outputs (names, shape, dtype, min/max) ---
+        if self.debug and not getattr(self, "_debug_decoder_outputs_printed", False):
+            self._debug_decoder_outputs_printed = True
+            self.logger.info("=== Decoder runtime outputs (session.run) ===")
+            self.logger.info("Returned %d tensors", len(outputs))
+
+            for node, value in zip(self.decoder_io.outputs, outputs):
+                if isinstance(value, np.ndarray):
+                    # min/max are useful but can be expensive; do it once
+                    try:
+                        vmin = float(value.min()) if value.size else None
+                        vmax = float(value.max()) if value.size else None
+                    except Exception:
+                        vmin = vmax = None
+                    self.logger.info(
+                        "OUT %-35s shape=%s dtype=%s min=%s max=%s",
+                        node.name, value.shape, value.dtype, vmin, vmax
+                    )
+                else:
+                    self.logger.info("OUT %-35s (non-ndarray) type=%s", node.name, type(value))
+
+            # Also print which one you're currently treating as logits
+            self.logger.info("Configured decoder_logits_name = %s", self.decoder_logits_name)
+
+
         dt = time.perf_counter() - t0
         self.logger.info("Decoder session.run() returned in %.3fs", dt)
 
         output_map = {node.name: value for node, value in zip(self.decoder_io.outputs, outputs)}
         logits = output_map[self.decoder_logits_name]
+
+        if self.debug and isinstance(logits, np.ndarray):
+            squeezed = np.squeeze(logits)
+            self.logger.info(
+                "Selected logits tensor shape=%s dtype=%s squeezed_shape=%s squeezed_size=%d",
+                logits.shape, logits.dtype, squeezed.shape, squeezed.size
+            )
+            # ✅ For this exported model, vocab is NOT the last dim; use squeezed size check instead.
+            if squeezed.size != 51865:
+                self.logger.warning(
+                    "⚠️ Logits size unexpected (expected 51865 vocab). Got squeezed_size=%d shape=%s",
+                    squeezed.size, logits.shape
+                )
 
         # Update KV cache from *_out
         if self.has_kv_cache:
@@ -362,7 +411,7 @@ class WhisperSmallQuantizedQNNSTT:
                     scores[tid] = -1e9
 
         # ✅ DEBUG: print top-5 once per transcription
-        if not hasattr(self, "_debug_top5_printed"):
+        if not getattr(self, "_debug_top5_printed", False):
             self._debug_top5_printed = True
             s = scores.copy()
             top = np.argsort(s)[-5:][::-1]
@@ -430,20 +479,20 @@ class WhisperSmallQuantizedQNNSTT:
     def _build_prompt_ids(self, language: str | None) -> list[int]:
         lang = (language or "en").lower()
 
-        # BOS for Whisper is <|startoftranscript|>
-        bos = self.tokenizer.bos_token_id
-        if bos is None:
-            bos = self.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
-        if bos is None:
-            raise RuntimeError("Cannot resolve <|startoftranscript|> token id.")
+        # ✅ Use Whisper's intended decoder start token (usually 50258 = <|startoftranscript|>)
+        start = getattr(self.config, "decoder_start_token_id", None)
+        if start is None:
+            start = self.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+        if start is None:
+            raise RuntimeError("Cannot resolve Whisper decoder start token id.")
 
-        # WhisperTokenizer gives the rest (lang/task/notimestamps)
+        # Get language/task prompt ids from tokenizer (e.g. <|en|><|transcribe|><|notimestamps|>)
+        rest: list[int] = []
         if hasattr(self.tokenizer, "get_decoder_prompt_ids"):
             items = self.tokenizer.get_decoder_prompt_ids(language=lang, task="transcribe")
             rest = [int(tid) for _, tid in items]
-            return [int(bos)] + rest
 
-        return [int(bos)]
+        return [int(start)] + rest
 
 
     def _initialize_kv_cache(self) -> dict[str, np.ndarray]:
