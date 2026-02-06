@@ -307,7 +307,7 @@ class WhisperSmallQuantizedQNNSTT:
         attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
         count = min(pos + 1, self.attn_max_len)
 
-        attn[0, 0, 0, -count:] = np.uint16(1)
+        attn[0, 0, 0, :count] = np.uint16(1) # left-aligned causal mask with 1s in the last `count` positions, 0s elsewhere
 
 
         # --- sanity check (only when debug=True) ---
