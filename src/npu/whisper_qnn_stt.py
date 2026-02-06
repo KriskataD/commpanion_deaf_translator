@@ -303,27 +303,19 @@ class WhisperSmallQuantizedQNNSTT:
 
         decoder_inputs[self.decoder_input_ids_name] = np.array([[token_id]], dtype=np.int32)
 
-        # attention_mask: [1,1,1,200] uint16
-        # Some QNN-exported models expect float16 values *bit-packed* into uint16.
-        am_dtype = self._dtype_for_input(self.decoder_attention_mask_name, fallback=np.uint16)
-        attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=am_dtype)
+        # attention_mask: [1,1,1,200] uint16 (plain values, not packed-fp16)
+        attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
         count = min(pos + 1, self.attn_max_len)
 
-        if attn.dtype == np.uint16:
-            #one_u16 = np.array([1.0], dtype=np.float16).view(np.uint16)[0]
-            #attn[0, 0, 0, -count:] = one_u16   # ✅ right-aligned
-            attn[0, 0, 0, -count:] = np.uint16(1)
-        else:
-            attn[0, 0, 0, -count:] = 1         # ✅ right-aligned
+        # Left-align active tokens so position_ids/kv cache line up with attention.
+        attn[0, 0, 0, :count] = np.uint16(1)
 
 
         # --- sanity check (only when debug=True) ---
-        if self.debug and attn.dtype == np.uint16:
+        if self.debug:
             flat = attn.reshape(-1)
             self.logger.info("ATTN first 12 (u16): %s", flat[:12].tolist())
             self.logger.info("ATTN last  12 (u16): %s", flat[-12:].tolist())
-            self.logger.info("ATTN first 12 (fp16): %s", flat[:12].view(np.float16).tolist())
-            self.logger.info("ATTN last  12 (fp16): %s", flat[-12:].view(np.float16).tolist())
 
         decoder_inputs[self.decoder_attention_mask_name] = attn
 
@@ -384,28 +376,19 @@ class WhisperSmallQuantizedQNNSTT:
             )
 
             # logits_u16 should be shape (vocab_size,) and dtype uint16 at this point
-            logits_u16 = logits.squeeze()
+            logits_u16 = np.ascontiguousarray(logits.squeeze())
 
-            # Ensure contiguous before view/debug
-            logits_u16 = np.ascontiguousarray(logits_u16)
-
-            # Compare token selection if you interpret the buffer two different ways
             arg_u16 = int(np.argmax(logits_u16))
-            arg_fp16_view = int(np.argmax(logits_u16.view(np.float16)))
+            self.logger.info("ARGMAX u16=%d", arg_u16)
 
-            self.logger.info(f"ARGMAX compare: u16={arg_u16}, fp16_view={arg_fp16_view}")
-
-            # Show top-5 both ways (debug only)
             top_u16 = np.argsort(logits_u16)[-5:][::-1]
-            top_fp16 = np.argsort(logits_u16.view(np.float16))[-5:][::-1]
+            self.logger.info("Top-5 (u16) ids: %s", top_u16.tolist())
 
-            self.logger.info(f"Top-5 (u16) ids: {top_u16.tolist()}")
-            self.logger.info(f"Top-5 (fp16_view) ids: {top_fp16.tolist()}")
-
-            # If you have a tokenizer object in scope:
             try:
-                self.logger.info(f"Top-5 (u16) toks: {[self.tokenizer.decode([int(i)]) for i in top_u16]}")
-                self.logger.info(f"Top-5 (fp16_view) toks: {[self.tokenizer.decode([int(i)]) for i in top_fp16]}")
+                self.logger.info(
+                    "Top-5 (u16) toks: %s",
+                    [self.tokenizer.decode([int(i)]) for i in top_u16],
+                )
             except Exception:
                 pass
 
@@ -451,16 +434,9 @@ class WhisperSmallQuantizedQNNSTT:
         if x.ndim != 1:
             x = x.reshape(-1)
 
-        # QNN often returns fp16 packed as uint16 bits
+        # Treat uint16 logits as plain integer scores (no packed-fp16 decoding).
         if x.dtype == np.uint16:
-            x_u16 = np.ascontiguousarray(x)
-            x_fp16 = x_u16.view(np.float16)
-
-            # If packed-fp16 is wrong, it often produces NaNs/Infs or nonsense
-            if np.isnan(x_fp16).any() or np.isinf(x_fp16).any():
-                scores = x_u16.astype(np.float32)  # fallback: treat as monotonic u16 scores
-            else:
-                scores = x_fp16.astype(np.float32)
+            scores = x.astype(np.float32)
         else:
             scores = x.astype(np.float32)
 
@@ -655,7 +631,7 @@ class WhisperSmallQuantizedQNNSTT:
         return feats.astype(np.float32)
 
     def _prepare_encoder_features(self, features: np.ndarray) -> np.ndarray:
-        # encoder expects uint16, but it's very likely float16 bit-patterns packed into uint16
+        # Encoder expects uint16, and this is the only input we pack from float16 bits.
         node = self.encoder_io.inputs[0]
         t = (node.type or "").lower()
 
