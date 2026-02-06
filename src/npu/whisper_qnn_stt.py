@@ -303,27 +303,18 @@ class WhisperSmallQuantizedQNNSTT:
 
         decoder_inputs[self.decoder_input_ids_name] = np.array([[token_id]], dtype=np.int32)
 
-        # attention_mask: [1,1,1,200] uint16
-        # Some QNN-exported models expect float16 values *bit-packed* into uint16.
-        am_dtype = self._dtype_for_input(self.decoder_attention_mask_name, fallback=np.uint16)
-        attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=am_dtype)
+        # attention_mask: [1,1,1,200] uint16 (plain values, not packed-fp16)
+        attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
         count = min(pos + 1, self.attn_max_len)
 
-        if attn.dtype == np.uint16:
-            #one_u16 = np.array([1.0], dtype=np.float16).view(np.uint16)[0]
-            #attn[0, 0, 0, -count:] = one_u16   # ✅ right-aligned
-            attn[0, 0, 0, -count:] = np.uint16(1)
-        else:
-            attn[0, 0, 0, -count:] = 1         # ✅ right-aligned
+        attn[0, 0, 0, -count:] = np.uint16(1)
 
 
         # --- sanity check (only when debug=True) ---
-        if self.debug and attn.dtype == np.uint16:
+        if self.debug:
             flat = attn.reshape(-1)
             self.logger.info("ATTN first 12 (u16): %s", flat[:12].tolist())
             self.logger.info("ATTN last  12 (u16): %s", flat[-12:].tolist())
-            self.logger.info("ATTN first 12 (fp16): %s", flat[:12].view(np.float16).tolist())
-            self.logger.info("ATTN last  12 (fp16): %s", flat[-12:].view(np.float16).tolist())
 
         decoder_inputs[self.decoder_attention_mask_name] = attn
 
@@ -655,7 +646,7 @@ class WhisperSmallQuantizedQNNSTT:
         return feats.astype(np.float32)
 
     def _prepare_encoder_features(self, features: np.ndarray) -> np.ndarray:
-        # encoder expects uint16, but it's very likely float16 bit-patterns packed into uint16
+        # Encoder expects uint16, and this is the only input we pack from float16 bits.
         node = self.encoder_io.inputs[0]
         t = (node.type or "").lower()
 
