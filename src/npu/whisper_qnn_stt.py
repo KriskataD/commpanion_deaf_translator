@@ -307,7 +307,8 @@ class WhisperSmallQuantizedQNNSTT:
         attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
         count = min(pos + 1, self.attn_max_len)
 
-        attn[0, 0, 0, :count] = np.uint16(1) # left-aligned causal mask with 1s in the last `count` positions, 0s elsewhere
+        # Left-align active tokens so position_ids/kv cache line up with attention.
+        attn[0, 0, 0, :count] = np.uint16(1)
 
 
         # --- sanity check (only when debug=True) ---
@@ -375,28 +376,19 @@ class WhisperSmallQuantizedQNNSTT:
             )
 
             # logits_u16 should be shape (vocab_size,) and dtype uint16 at this point
-            logits_u16 = logits.squeeze()
+            logits_u16 = np.ascontiguousarray(logits.squeeze())
 
-            # Ensure contiguous before view/debug
-            logits_u16 = np.ascontiguousarray(logits_u16)
-
-            # Compare token selection if you interpret the buffer two different ways
             arg_u16 = int(np.argmax(logits_u16))
-            arg_fp16_view = int(np.argmax(logits_u16.view(np.float16)))
+            self.logger.info("ARGMAX u16=%d", arg_u16)
 
-            self.logger.info(f"ARGMAX compare: u16={arg_u16}, fp16_view={arg_fp16_view}")
-
-            # Show top-5 both ways (debug only)
             top_u16 = np.argsort(logits_u16)[-5:][::-1]
-            top_fp16 = np.argsort(logits_u16.view(np.float16))[-5:][::-1]
+            self.logger.info("Top-5 (u16) ids: %s", top_u16.tolist())
 
-            self.logger.info(f"Top-5 (u16) ids: {top_u16.tolist()}")
-            self.logger.info(f"Top-5 (fp16_view) ids: {top_fp16.tolist()}")
-
-            # If you have a tokenizer object in scope:
             try:
-                self.logger.info(f"Top-5 (u16) toks: {[self.tokenizer.decode([int(i)]) for i in top_u16]}")
-                self.logger.info(f"Top-5 (fp16_view) toks: {[self.tokenizer.decode([int(i)]) for i in top_fp16]}")
+                self.logger.info(
+                    "Top-5 (u16) toks: %s",
+                    [self.tokenizer.decode([int(i)]) for i in top_u16],
+                )
             except Exception:
                 pass
 
@@ -442,16 +434,9 @@ class WhisperSmallQuantizedQNNSTT:
         if x.ndim != 1:
             x = x.reshape(-1)
 
-        # QNN often returns fp16 packed as uint16 bits
+        # Treat uint16 logits as plain integer scores (no packed-fp16 decoding).
         if x.dtype == np.uint16:
-            x_u16 = np.ascontiguousarray(x)
-            x_fp16 = x_u16.view(np.float16)
-
-            # If packed-fp16 is wrong, it often produces NaNs/Infs or nonsense
-            if np.isnan(x_fp16).any() or np.isinf(x_fp16).any():
-                scores = x_u16.astype(np.float32)  # fallback: treat as monotonic u16 scores
-            else:
-                scores = x_fp16.astype(np.float32)
+            scores = x.astype(np.float32)
         else:
             scores = x.astype(np.float32)
 
