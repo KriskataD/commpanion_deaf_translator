@@ -301,7 +301,8 @@ class WhisperSmallQuantizedQNNSTT:
         """Run ONE decoder call. The model expects input_ids [1,1], attention_mask [1,1,1,200], position_ids [1]."""
         decoder_inputs: dict[str, Any] = {}
 
-        decoder_inputs[self.decoder_input_ids_name] = np.array([[token_id]], dtype=np.int32)
+        input_ids_dtype = self._dtype_for_input(self.decoder_input_ids_name, fallback=np.int32)
+        decoder_inputs[self.decoder_input_ids_name] = np.array([[token_id]], dtype=input_ids_dtype)
 
         # attention_mask: [1,1,1,200] uint16 (plain values, not packed-fp16)
         attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
