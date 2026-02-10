@@ -441,8 +441,8 @@ class WhisperSmallQuantizedQNNSTT:
         attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
         count = min(pos + 1, self.attn_max_len)
 
-        # Left-align active tokens so position_ids/kv cache line up with attention.
-        attn[0, 0, 0, :count] = np.uint16(1)
+        # Right-align active tokens so position_ids/kv cache line up with attention.
+        attn[0, 0, 0, -count:] = np.uint16(1)
 
         # --- sanity check (only when debug=True) ---
         if self.debug:
@@ -501,6 +501,45 @@ class WhisperSmallQuantizedQNNSTT:
         logits = output_map[self.decoder_logits_name]
 
         if self.debug and isinstance(logits, np.ndarray):
+            x = np.squeeze(logits)
+            if x.ndim != 1:
+                x = x.reshape(-1)
+
+            if x.dtype == np.uint16:
+                x_u16 = np.ascontiguousarray(x)
+                scores_int = x_u16.astype(np.float32)
+                scores_f16 = x_u16.view(np.float16).astype(np.float32)
+
+                # Show BOTH top-5 and whether notimestamps is being preferred
+                def show_top(label, scores):
+                    top = np.argsort(scores)[-5:][::-1]
+                    toks = []
+                    for i in top:
+                        tid = int(i)
+                        try:
+                            toks.append((tid, self.tokenizer.decode([tid], skip_special_tokens=False), float(scores[tid])))
+                        except Exception:
+                            toks.append((tid, "<?>", float(scores[tid])))
+                    self.logger.info("%s TOP5: %s", label, toks)
+
+                show_top("LOGITS u16-int", scores_int)
+                show_top("LOGITS u16->f16", scores_f16)
+
+                # Check prompt-following: after <|transcribe|>, model should like <|notimestamps|>
+                try:
+                    nt = self.tokenizer.convert_tokens_to_ids("<|notimestamps|>")
+                    if nt is not None and 0 <= nt < scores_int.shape[0]:
+                        self.logger.info("score(nt) int=%.3f f16=%.3f",
+                                        float(scores_int[nt]), float(scores_f16[nt]))
+                except Exception:
+                    pass
+            else:
+                scores = x.astype(np.float32)
+                top = np.argsort(scores)[-5:][::-1]
+                self.logger.info("LOGITS float TOP5 ids: %s", [int(i) for i in top])
+
+
+        if self.debug and isinstance(logits, np.ndarray):
             squeezed = np.squeeze(logits)
             self.logger.info(
                 "Selected logits tensor shape=%s dtype=%s squeezed_shape=%s squeezed_size=%d",
@@ -547,9 +586,77 @@ class WhisperSmallQuantizedQNNSTT:
             x = x.reshape(-1)
 
         # Treat uint16 logits as plain integer scores (no packed-fp16 decoding).
+        #if x.dtype == np.uint16:
+        #    scores = x.astype(np.float32)
+        #else:
+        #    scores = x.astype(np.float32)
+
+        # --- Handle uint16 logits: integer scores OR packed-fp16 bits ---
         if x.dtype == np.uint16:
-            scores = x.astype(np.float32)
+            # Make contiguous so .view(np.float16) is safe/valid
+            x_u16 = np.ascontiguousarray(x)
+
+            # Detect once per object lifetime (or per run if you reset this flag)
+            if not hasattr(self, "_u16_logits_mode"):
+                scores_int = x_u16.astype(np.float32)
+
+                # reinterpret uint16 bits as float16
+                scores_f16 = x_u16.view(np.float16).astype(np.float32)
+
+                # Stats to decide if f16 interpretation looks "logit-like"
+                int_min, int_max = float(scores_int.min()), float(scores_int.max())
+                # use nan-safe stats for fp16 view
+                f16_finite = np.isfinite(scores_f16)
+                finite_ratio = float(np.mean(f16_finite)) if scores_f16.size else 0.0
+                f16_min = float(np.nanmin(scores_f16)) if scores_f16.size else 0.0
+                f16_max = float(np.nanmax(scores_f16)) if scores_f16.size else 0.0
+
+                # Heuristic:
+                # - Real logits are typically small-ish floats (often within ~[-50, 50], sometimes wider).
+                # - Integer interpretation tends to yield huge ranges [0..65535].
+                f16_absmax = max(abs(f16_min), abs(f16_max))
+                int_range = int_max - int_min
+
+                use_packed_fp16 = (finite_ratio > 0.99) and (f16_absmax <= 200.0) and (int_range >= 1000.0)
+
+                self._u16_logits_mode = "packed_fp16" if use_packed_fp16 else "uint16_int"
+
+                # --- One-time debug print comparing interpretations ---
+                if self.debug:
+                    top_int = np.argsort(scores_int)[-5:][::-1]
+                    top_f16 = np.argsort(scores_f16)[-5:][::-1]
+
+                    self.logger.info(
+                        "u16 logits detect: mode=%s | int[min,max]=[%.1f,%.1f] range=%.1f | "
+                        "f16[min,max]=[%.3f,%.3f] absmax=%.3f finite=%.3f",
+                        self._u16_logits_mode, int_min, int_max, int_range,
+                        f16_min, f16_max, f16_absmax, finite_ratio
+                    )
+
+                    try:
+                        self.logger.info(
+                            "TOP5 int: %s",
+                            [(int(i),
+                            self.tokenizer.decode([int(i)], skip_special_tokens=False),
+                            float(scores_int[int(i)])) for i in top_int]
+                        )
+                        self.logger.info(
+                            "TOP5 f16: %s",
+                            [(int(i),
+                            self.tokenizer.decode([int(i)], skip_special_tokens=False),
+                            float(scores_f16[int(i)])) for i in top_f16]
+                        )
+                    except Exception:
+                        self.logger.info("TOP5 ids int=%s f16=%s", top_int.tolist(), top_f16.tolist())
+
+            # Use the chosen mode
+            if getattr(self, "_u16_logits_mode", "packed_fp16") == "packed_fp16":
+                scores = x_u16.view(np.float16).astype(np.float32)
+            else:
+                scores = x_u16.astype(np.float32)
+
         else:
+            # Non-uint16 logits: treat as normal numeric logits
             scores = x.astype(np.float32)
 
         #eot = int(getattr(self.tokenizer, "eos_token_id", -1))
@@ -654,7 +761,8 @@ class WhisperSmallQuantizedQNNSTT:
                 #cache[node.name] = np.zeros(shape, dtype=self._numpy_dtype_from_ort(node.type))
                 dtype = self._numpy_dtype_from_ort(node.type)
                 if dtype == np.uint8:
-                    cache[node.name] = np.full(shape, 128, dtype=np.uint8)  # ✅ common zero-point
+                    #cache[node.name] = np.full(shape, 128, dtype=np.uint8)  # ✅ common zero-point
+                    cache[node.name] = np.zeros(shape, dtype=np.uint8)  # ✅ common zero-point
                 else:
                     cache[node.name] = np.zeros(shape, dtype=dtype)
         return cache
