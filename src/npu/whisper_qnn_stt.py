@@ -493,10 +493,15 @@ class WhisperSmallQuantizedQNNSTT:
         attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
         count = min(pos + 1, self.attn_max_len)
 
-        # Left-align active tokens so position_ids/kv cache line up with attention.
-        attn[0, 0, 0, :count] = np.uint16(1)
+        attn_f16 = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.float16)
 
-        decoder_inputs[self.decoder_attention_mask_name] = attn
+        # Right-align active tokens so position_ids/kv cache line up with attention.
+        attn_f16[0, 0, 0, self.attn_max_len - count:] = np.uint16(1)
+
+        decoder_inputs[self.decoder_attention_mask_name] = attn_f16.view(np.uint16)
+
+        m = decoder_inputs[self.decoder_attention_mask_name]
+        self.logger.info("attn_mask uint16 min=%d max=%d", int(m.min()), int(m.max()))
 
         # position_ids: [1] int32 (NOT [1,1])
         pid_dtype = self._dtype_for_input(self.decoder_position_ids_name, fallback=np.int32)
