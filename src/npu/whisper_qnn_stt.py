@@ -443,8 +443,8 @@ class WhisperSmallQuantizedQNNSTT:
         attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
         count = min(pos + 1, self.attn_max_len)
 
-        # Right-align active tokens so position_ids/kv cache line up with attention.
-        attn[0, 0, 0, -count:] = np.uint16(1)
+        # Left-align active tokens so position_ids/kv cache line up with attention.
+        attn[0, 0, 0, :count] = np.uint16(1)
 
         # --- sanity check (only when debug=True) ---
         if self.debug:
