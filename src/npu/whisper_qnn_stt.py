@@ -194,6 +194,8 @@ class WhisperSmallQuantizedQNNSTT:
 
         if self.debug:
             self._debug_top5_printed = False
+            self._debug_logits_interpretation_printed = False
+            self._debug_logits_fallback_warned = False
 
         audio = self._load_and_log_audio(Path(wav_path))
         features = self._extract_and_pack_features(audio)
@@ -531,6 +533,46 @@ class WhisperSmallQuantizedQNNSTT:
                     squeezed.size, logits.shape
                 )
 
+            if not getattr(self, "_debug_logits_interpretation_printed", False):
+                self._debug_logits_interpretation_printed = True
+
+                logits_u16 = np.ascontiguousarray(logits.squeeze()).reshape(-1)
+                top_u16 = np.argsort(logits_u16)[-5:][::-1]
+
+                scores_f16 = logits_u16.view(np.float16).astype(np.float32)
+                top_f16 = np.argsort(scores_f16)[-5:][::-1]
+
+                finite_ratio = float(np.isfinite(scores_f16).mean()) if scores_f16.size else 1.0
+                min_f16 = float(np.nanmin(scores_f16)) if scores_f16.size else float("nan")
+                max_f16 = float(np.nanmax(scores_f16)) if scores_f16.size else float("nan")
+
+                self.logger.info("Logits interpretation check (one-time):")
+                self.logger.info("Top-5 (u16 integer) ids: %s", top_u16.tolist())
+                for i in top_u16:
+                    tid = int(i)
+                    self.logger.info(
+                        "  u16 id=%d token=%r",
+                        tid,
+                        self.tokenizer.decode([tid], skip_special_tokens=False),
+                    )
+
+                self.logger.info("Top-5 (fp16 decoded) ids: %s", top_f16.tolist())
+                for i in top_f16:
+                    tid = int(i)
+                    self.logger.info(
+                        "  fp16 id=%d token=%r score=%f",
+                        tid,
+                        self.tokenizer.decode([tid], skip_special_tokens=False),
+                        float(scores_f16[tid]),
+                    )
+
+                self.logger.info(
+                    "fp16 sanity: finite=%.2f%% min=%s max=%s",
+                    finite_ratio * 100.0,
+                    min_f16,
+                    max_f16,
+                )
+
         # Update KV cache from *_out
         if self.has_kv_cache:
             new_cache = {name.replace("_out", "_in"): output_map[name] for name in self.kv_self_out_names}
@@ -540,17 +582,7 @@ class WhisperSmallQuantizedQNNSTT:
         return logits, new_cache
 
     def _select_next_token_from_logits(self, logits: np.ndarray) -> int:
-        x = np.squeeze(logits)
-
-        # Make sure we end up with [vocab]
-        if x.ndim != 1:
-            x = x.reshape(-1)
-
-        # Treat uint16 logits as plain integer scores (no packed-fp16 decoding).
-        if x.dtype == np.uint16:
-            scores = x.astype(np.float32)
-        else:
-            scores = x.astype(np.float32)
+        scores = self._logits_to_scores(logits)
 
         #eot = int(getattr(self.tokenizer, "eos_token_id", -1))
         #if getattr(self, "_block_eot_steps", 0) > 0 and 0 <= eot < scores.shape[0]:
@@ -576,6 +608,26 @@ class WhisperSmallQuantizedQNNSTT:
             self.logger.info("Top-5 scores: %s", [float(s[int(t)]) for t in top])
 
         return int(np.argmax(scores))
+
+    def _logits_to_scores(self, logits: np.ndarray) -> np.ndarray:
+        x = np.ascontiguousarray(np.squeeze(logits)).reshape(-1)
+
+        if x.dtype == np.uint16:
+            scores = x.view(np.float16).astype(np.float32)
+            finite_ratio = float(np.isfinite(scores).mean()) if scores.size else 1.0
+
+            if finite_ratio < 0.99:
+                if self.debug and not getattr(self, "_debug_logits_fallback_warned", False):
+                    self._debug_logits_fallback_warned = True
+                    self.logger.warning(
+                        "Decoded fp16 logits have low finite ratio (%.2f%%); falling back to uint16->float32 interpretation.",
+                        finite_ratio * 100.0,
+                    )
+                return x.astype(np.float32)
+
+            return scores
+
+        return x.astype(np.float32)
 
     # --------------------------
     # IO discovery helpers
