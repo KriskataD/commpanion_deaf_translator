@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 import wave
 import time
+from collections import Counter
 
 import numpy as np
 import onnxruntime as ort
@@ -74,6 +75,7 @@ class WhisperSmallQuantizedQNNSTT:
         self.decoder_dir = Path(decoder_dir)
         self.prefer_qnn = prefer_qnn
         self.debug = debug
+        self.debug_kv = debug
 
         self._resolve_model_paths_and_validate()
         self._create_sessions()
@@ -193,8 +195,6 @@ class WhisperSmallQuantizedQNNSTT:
         self.logger.info("Starting QNN transcription: %s (language=%s)", wav_path, language or "auto")
 
         if self.debug:
-            self._debug_top5_printed = False
-            self._debug_logits_interpretation_printed = False
             self._debug_logits_fallback_warned = False
 
         audio = self._load_and_log_audio(Path(wav_path))
@@ -259,13 +259,36 @@ class WhisperSmallQuantizedQNNSTT:
         # This warms the self-cache and produces logits for the next token.
         logits = None
         pos = 0
-        for tok in prompt_ids:
+        prev_cache_out: dict[str, np.ndarray] | None = None
+        for t, tok in enumerate(prompt_ids):
+            if self.debug_kv and prev_cache_out is not None:
+                wiring_ok = self._cache_dicts_equal(kv_cache, prev_cache_out)
+                self.logger.info("PREFILL wiring: cache_in(t+1)==cache_out(t): %s", wiring_ok)
+
+            cache_in = kv_cache
             logits, kv_cache = self._decoder_step(
                 token_id=int(tok),
                 pos=pos,
                 kv_cache=kv_cache,
                 enc_cross_cache=enc_cross_cache,
             )
+
+            if self.debug_kv:
+                layers_match, common_top_idx, global_max = self._cache_delta_summary(cache_in, kv_cache, pos)
+                tok_str = self.tokenizer.decode([int(tok)], skip_special_tokens=False)
+                self.logger.info(
+                    "PREFILL t=%d token=%d/%r pos=%d cache_delta: layers_match_pos=%d/%d common_top_idx=%d global_max=%s",
+                    t,
+                    int(tok),
+                    tok_str,
+                    pos,
+                    layers_match,
+                    len(cache_in),
+                    common_top_idx,
+                    global_max,
+                )
+
+            prev_cache_out = kv_cache
             pos += 1
             if pos >= self.attn_max_len:
                 break
@@ -299,7 +322,7 @@ class WhisperSmallQuantizedQNNSTT:
 
         # We already have logits from the last prefill step (unless prompt was empty)
         for step in range(max_new_tokens):
-            if step % 10 == 0:
+            if self.debug_kv and step % 10 == 0:
                 self.logger.info("Decoder gen step %d/%d", step + 1, max_new_tokens)
 
             if logits is None:
@@ -313,6 +336,23 @@ class WhisperSmallQuantizedQNNSTT:
                 )
 
             next_token = int(self._select_next_token_from_logits(logits))
+            if self.debug_kv and step == 0:
+                top5_ids, top5_scores = self._topk_from_logits(logits, k=5)
+                top5_toks = [self.tokenizer.decode([int(tid)], skip_special_tokens=False) for tid in top5_ids]
+                chosen_tok = self.tokenizer.decode([next_token], skip_special_tokens=False)
+                self.logger.info(
+                    "GEN-START from last-prompt logits: top5_ids=%s top5_toks=%s chosen_id=%d chosen_tok=%r",
+                    top5_ids,
+                    top5_toks,
+                    next_token,
+                    chosen_tok,
+                )
+                self.logger.info(
+                    "GEN-STEP0 inputs: pos=%d input_id=%d/%r (from last prompt logits)",
+                    pos,
+                    next_token,
+                    chosen_tok,
+                )
 
             # If model ends immediately, stop.
             if next_token == eot_token:
@@ -328,6 +368,16 @@ class WhisperSmallQuantizedQNNSTT:
                 kv_cache=kv_cache,
                 enc_cross_cache=enc_cross_cache,
             )
+
+            if self.debug_kv and step == 0:
+                top5_ids, top5_scores = self._topk_from_logits(logits, k=5)
+                top5_toks = [self.tokenizer.decode([int(tid)], skip_special_tokens=False) for tid in top5_ids]
+                self.logger.info(
+                    "GEN-STEP1 logits: top5_ids=%s top5_toks=%s top5_scores=%s",
+                    top5_ids,
+                    top5_toks,
+                    [float(s) for s in top5_scores],
+                )
 
             pos += 1
             if pos >= self.attn_max_len:
@@ -446,12 +496,6 @@ class WhisperSmallQuantizedQNNSTT:
         # Left-align active tokens so position_ids/kv cache line up with attention.
         attn[0, 0, 0, :count] = np.uint16(1)
 
-        # --- sanity check (only when debug=True) ---
-        if self.debug:
-            flat = attn.reshape(-1)
-            self.logger.info("ATTN first 12 (u16): %s", flat[:12].tolist())
-            self.logger.info("ATTN last  12 (u16): %s", flat[-12:].tolist())
-
         decoder_inputs[self.decoder_attention_mask_name] = attn
 
         # position_ids: [1] int32 (NOT [1,1])
@@ -466,112 +510,15 @@ class WhisperSmallQuantizedQNNSTT:
         if self.decoder_uses_cross_cache:
             decoder_inputs.update(enc_cross_cache)
 
-        if self.debug:
-            self._log_decoder_inputs(decoder_inputs)
-
         t0 = time.perf_counter()
         outputs = self.decoder_session.run(None, decoder_inputs)
 
-        # --- One-time: dump runtime outputs (names, shape, dtype, min/max) ---
-        if self.debug and not getattr(self, "_debug_decoder_outputs_printed", False):
-            self._debug_decoder_outputs_printed = True
-            self.logger.info("=== Decoder runtime outputs (session.run) ===")
-            self.logger.info("Returned %d tensors", len(outputs))
-
-            for node, value in zip(self.decoder_io.outputs, outputs):
-                if isinstance(value, np.ndarray):
-                    # min/max are useful but can be expensive; do it once
-                    try:
-                        vmin = float(value.min()) if value.size else None
-                        vmax = float(value.max()) if value.size else None
-                    except Exception:
-                        vmin = vmax = None
-                    self.logger.info(
-                        "OUT %-35s shape=%s dtype=%s min=%s max=%s",
-                        node.name, value.shape, value.dtype, vmin, vmax
-                    )
-                else:
-                    self.logger.info("OUT %-35s (non-ndarray) type=%s", node.name, type(value))
-
-            # Also print which one you're currently treating as logits
-            self.logger.info("Configured decoder_logits_name = %s", self.decoder_logits_name)
-
         dt = time.perf_counter() - t0
-        self.logger.info("Decoder session.run() returned in %.3fs", dt)
+        if self.debug_kv:
+            self.logger.info("Decoder session.run() returned in %.3fs", dt)
 
         output_map = {node.name: value for node, value in zip(self.decoder_io.outputs, outputs)}
         logits = output_map[self.decoder_logits_name]
-
-        if self.debug and isinstance(logits, np.ndarray):
-            squeezed = np.squeeze(logits)
-            self.logger.info(
-                "Selected logits tensor shape=%s dtype=%s squeezed_shape=%s squeezed_size=%d",
-                logits.shape, logits.dtype, squeezed.shape, squeezed.size
-            )
-
-            # logits_u16 should be shape (vocab_size,) and dtype uint16 at this point
-            logits_u16 = np.ascontiguousarray(logits.squeeze())
-
-            arg_u16 = int(np.argmax(logits_u16))
-            self.logger.info("ARGMAX u16=%d", arg_u16)
-
-            top_u16 = np.argsort(logits_u16)[-5:][::-1]
-            self.logger.info("Top-5 (u16) ids: %s", top_u16.tolist())
-
-            try:
-                self.logger.info(
-                    "Top-5 (u16) toks: %s",
-                    [self.tokenizer.decode([int(i)]) for i in top_u16],
-                )
-            except Exception:
-                pass
-
-            # ✅ For this exported model, vocab is NOT the last dim; use squeezed size check instead.
-            if squeezed.size != 51865:
-                self.logger.warning(
-                    "⚠️ Logits size unexpected (expected 51865 vocab). Got squeezed_size=%d shape=%s",
-                    squeezed.size, logits.shape
-                )
-
-            if not getattr(self, "_debug_logits_interpretation_printed", False):
-                self._debug_logits_interpretation_printed = True
-
-                logits_u16 = np.ascontiguousarray(logits.squeeze()).reshape(-1)
-                top_u16 = np.argsort(logits_u16)[-5:][::-1]
-
-                scores_f16 = logits_u16.view(np.float16).astype(np.float32)
-                top_f16 = np.argsort(scores_f16)[-5:][::-1]
-
-                finite_ratio = float(np.isfinite(scores_f16).mean()) if scores_f16.size else 1.0
-                min_f16 = float(np.nanmin(scores_f16)) if scores_f16.size else float("nan")
-                max_f16 = float(np.nanmax(scores_f16)) if scores_f16.size else float("nan")
-
-                self.logger.info("Logits interpretation check (one-time):")
-                self.logger.info("Top-5 (u16 integer) ids: %s", top_u16.tolist())
-                for i in top_u16:
-                    tid = int(i)
-                    self.logger.info(
-                        "  u16 id=%d token=%r",
-                        tid,
-                        self.tokenizer.decode([tid], skip_special_tokens=False),
-                    )
-
-                self.logger.info("Top-5 (fp16 decoded) ids: %s", top_f16.tolist())
-                for i in top_f16:
-                    tid = int(i)
-                    self.logger.info(
-                        "  fp16 id=%d token=%r score=%f",
-                        tid,
-                        self.tokenizer.decode([tid], skip_special_tokens=False),
-                        float(scores_f16[tid]),
-                    )
-
-                self.logger.info(
-                    "fp16 sanity: finite=%.2f%% min=%s max=%s",
-                    finite_ratio * 100.0,
-                    min_f16,
-                    max_f16,
-                )
 
         # Update KV cache from *_out
         if self.has_kv_cache:
@@ -595,19 +542,60 @@ class WhisperSmallQuantizedQNNSTT:
                 if 0 <= tid < scores.shape[0]:
                     scores[tid] = -1e9
 
-        # ✅ DEBUG: print top-5 once per transcription
-        if not getattr(self, "_debug_top5_printed", False):
-            self._debug_top5_printed = True
-            s = scores.copy()
-            top = np.argsort(s)[-5:][::-1]
-            self.logger.info("Top-5 token ids: %s", top.tolist())
-            self.logger.info(
-                "Top-5 tokens: %s",
-                [self.tokenizer.decode([int(t)], skip_special_tokens=False) for t in top],
-            )
-            self.logger.info("Top-5 scores: %s", [float(s[int(t)]) for t in top])
-
         return int(np.argmax(scores))
+
+    def _topk_from_logits(self, logits: np.ndarray, k: int = 5) -> tuple[list[int], list[float]]:
+        scores = self._logits_to_scores(logits)
+        top = np.argsort(scores)[-k:][::-1]
+        return [int(i) for i in top], [float(scores[int(i)]) for i in top]
+
+    def _infer_seq_axis(self, tensor: np.ndarray, self_cache_len: int) -> int:
+        matches = [i for i, d in enumerate(tensor.shape) if int(d) == int(self_cache_len)]
+        if not matches:
+            raise RuntimeError(f"Unable to infer seq axis for cache tensor shape={tensor.shape}")
+        return matches[-1]
+
+    def _cache_delta_summary(
+        self,
+        cache_in: dict[str, np.ndarray],
+        cache_out: dict[str, np.ndarray],
+        position: int,
+    ) -> tuple[int, int, float]:
+        top_idxs: list[int] = []
+        global_max = 0.0
+
+        for name, in_tensor in cache_in.items():
+            out_tensor = cache_out.get(name)
+            if not isinstance(in_tensor, np.ndarray) or not isinstance(out_tensor, np.ndarray):
+                continue
+
+            seq_axis = self._infer_seq_axis(in_tensor, self.self_cache_len)
+            if in_tensor.dtype.kind in {"u", "i"} or out_tensor.dtype.kind in {"u", "i"}:
+                delta = np.abs(out_tensor.astype(np.int32) - in_tensor.astype(np.int32))
+            else:
+                delta = np.abs(out_tensor.astype(np.float32) - in_tensor.astype(np.float32))
+
+            reduce_axes = tuple(ax for ax in range(delta.ndim) if ax != seq_axis)
+            delta_per_pos = delta if not reduce_axes else np.max(delta, axis=reduce_axes)
+            delta_per_pos = np.asarray(delta_per_pos).reshape(-1)
+            top_idx = int(np.argmax(delta_per_pos))
+            top_idxs.append(top_idx)
+            global_max = max(global_max, float(np.max(delta_per_pos)))
+
+        if not top_idxs:
+            return 0, -1, global_max
+
+        common_top_idx = Counter(top_idxs).most_common(1)[0][0]
+        layers_match_pos = int(sum(1 for idx in top_idxs if idx == int(position)))
+        return layers_match_pos, int(common_top_idx), global_max
+
+    def _cache_dicts_equal(self, lhs: dict[str, np.ndarray], rhs: dict[str, np.ndarray]) -> bool:
+        if set(lhs.keys()) != set(rhs.keys()):
+            return False
+        for k in lhs:
+            if not np.array_equal(lhs[k], rhs[k]):
+                return False
+        return True
 
     def _logits_to_scores(self, logits: np.ndarray) -> np.ndarray:
         x = np.ascontiguousarray(np.squeeze(logits)).reshape(-1)
@@ -746,20 +734,3 @@ class WhisperSmallQuantizedQNNSTT:
         if "float" in t:
             return np.float32
         return np.float32
-
-    # --------------------------
-    # Logging helpers
-    # --------------------------
-    def _brief_tensor(self, x: Any) -> str:
-        if not isinstance(x, np.ndarray):
-            return f"{type(x)}"
-        if x.size == 0:
-            return f"shape={x.shape} dtype={x.dtype} empty"
-        try:
-            return f"shape={x.shape} dtype={x.dtype} min={x.min()} max={x.max()}"
-        except Exception:
-            return f"shape={x.shape} dtype={x.dtype}"
-
-    def _log_decoder_inputs(self, decoder_inputs: dict[str, Any]) -> None:
-        for k, v in decoder_inputs.items():
-            self.logger.info("DEC IN %-40s %s", k, self._brief_tensor(v))
