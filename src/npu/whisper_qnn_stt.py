@@ -490,22 +490,27 @@ class WhisperSmallQuantizedQNNSTT:
         decoder_inputs[self.decoder_input_ids_name] = np.array([[token_id]], dtype=input_ids_dtype)
 
         # attention_mask: [1,1,1,200] uint16 (plain values, not packed-fp16)
-        attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
+        #attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
         count = min(pos + 1, self.attn_max_len)
 
         attn_f16 = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.float16)
 
         # Right-align active tokens so position_ids/kv cache line up with attention.
-        attn_f16[0, 0, 0, self.attn_max_len - count:] = np.uint16(1)
+        attn_f16[0, 0, 0, -count:] = np.float16(1.0)
 
         decoder_inputs[self.decoder_attention_mask_name] = attn_f16.view(np.uint16)
 
         m = decoder_inputs[self.decoder_attention_mask_name]
         self.logger.info("attn_mask uint16 min=%d max=%d", int(m.min()), int(m.max()))
 
+
         # position_ids: [1] int32 (NOT [1,1])
         pid_dtype = self._dtype_for_input(self.decoder_position_ids_name, fallback=np.int32)
-        decoder_inputs[self.decoder_position_ids_name] = np.array([pos], dtype=pid_dtype)
+        pid = self.self_cache_len - count   # 199,198,197,... for pos=0,1,2...
+        if pid < 0:
+            pid = 0
+        decoder_inputs[self.decoder_position_ids_name] = np.array([pid], dtype=pid_dtype)
+
 
         # KV cache in (self)
         if self.has_kv_cache:
@@ -514,6 +519,8 @@ class WhisperSmallQuantizedQNNSTT:
         # Cross cache in
         if self.decoder_uses_cross_cache:
             decoder_inputs.update(enc_cross_cache)
+
+        self.logger.info("pos=%d count=%d pid=%d", pos, count, pid)
 
         t0 = time.perf_counter()
         outputs = self.decoder_session.run(None, decoder_inputs)
