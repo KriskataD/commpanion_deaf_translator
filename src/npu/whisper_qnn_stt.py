@@ -441,8 +441,8 @@ class WhisperSmallQuantizedQNNSTT:
         attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
         count = min(pos + 1, self.attn_max_len)
 
-        # Left-align active tokens so position_ids/kv cache line up with attention.
-        attn[0, 0, 0, :count] = np.uint16(1)
+        # Right-align active tokens so position_ids/kv cache line up with attention.
+        attn[0, 0, 0, -count:] = np.uint16(1)
 
         # --- sanity check (only when debug=True) ---
         if self.debug:
@@ -631,12 +631,10 @@ class WhisperSmallQuantizedQNNSTT:
     def _build_prompt_ids(self, language: str | None) -> list[int]:
         lang = (language or "en").lower()
 
-        # ✅ Use Whisper's intended decoder start token (usually 50258 = <|startoftranscript|>)
-        start = getattr(self.config, "decoder_start_token_id", None)
-        if start is None:
-            start = self.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
-        if start is None:
-            raise RuntimeError("Cannot resolve Whisper decoder start token id.")
+        # Pull SOT directly from WhisperTokenizer rather than relying on a numeric id.
+        start = self.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+        if start is None or int(start) < 0:
+            raise RuntimeError("Cannot resolve WhisperTokenizer SOT token id.")
 
         # Get language/task prompt ids from tokenizer (e.g. <|en|><|transcribe|><|notimestamps|>)
         rest: list[int] = []
