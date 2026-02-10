@@ -293,7 +293,7 @@ class WhisperSmallQuantizedQNNSTT:
             pos, self.attn_max_len, max_new_tokens
         )
 
-        self._block_eot_steps = 8   # Fix 4: block EOS/EOT for first N generation selections
+        # self._block_eot_steps = 8   # Fix 4: block EOS/EOT for first N generation selections
 
         # We already have logits from the last prefill step (unless prompt was empty)
         for step in range(max_new_tokens):
@@ -552,10 +552,10 @@ class WhisperSmallQuantizedQNNSTT:
         else:
             scores = x.astype(np.float32)
 
-        eot = int(getattr(self.tokenizer, "eos_token_id", -1))
-        if getattr(self, "_block_eot_steps", 0) > 0 and 0 <= eot < scores.shape[0]:
-            scores[eot] = -1e9
-            self._block_eot_steps -= 1
+        #eot = int(getattr(self.tokenizer, "eos_token_id", -1))
+        #if getattr(self, "_block_eot_steps", 0) > 0 and 0 <= eot < scores.shape[0]:
+        #    scores[eot] = -1e9
+        #    self._block_eot_steps -= 1
 
         # Suppress Whisper control/special tokens
         if getattr(self, "suppress_tokens", None):
