@@ -311,78 +311,84 @@ class WhisperSmallQuantizedQNNSTT:
         enc_cross_cache: dict[str, np.ndarray],
     ) -> list[int]:
         kv_cache = self._initialize_kv_cache() if self.has_kv_cache else {}
-        logits: np.ndarray | None = None
-        pos = 0
-        prev_cache_out: dict[str, np.ndarray] | None = None
         input_ids: list[int] = prompt_ids.copy()
+        prompt_len = len(prompt_ids)
 
         eot_token = int(getattr(self.tokenizer, "eos_token_id", -1))
         if eot_token < 0:
             raise RuntimeError("Tokenizer eos_token_id missing.")
 
-        prompt_len = len(prompt_ids)
+        output_length = len(input_ids)
+        prev_cache_out: dict[str, np.ndarray] | None = None
         generation_started = False
-        max_new_tokens = 0
         gen_step = 0
 
-        while pos < self.attn_max_len:
-            if pos < prompt_len:
-                tok = int(prompt_ids[pos])
+        # Keep sequence semantics close to HF wrapper: consume token at index n,
+        # then optionally append argmax token when n reaches generation boundary.
+        for n in range(max(0, self.attn_max_len - 1)):
+            if n >= len(input_ids):
+                break
 
-                if self.debug_kv and prev_cache_out is not None:
-                    wiring_ok = self._cache_dicts_equal(kv_cache, prev_cache_out)
-                    self.logger.info("PREFILL wiring: cache_in(t+1)==cache_out(t): %s", wiring_ok)
+            tok = int(input_ids[n])
 
-                cache_in = kv_cache
-                logits, kv_cache = self._decoder_step(
-                    token_id=tok,
-                    pos=pos,
-                    kv_cache=kv_cache,
-                    enc_cross_cache=enc_cross_cache,
+            if self.debug_kv and n < prompt_len and prev_cache_out is not None:
+                wiring_ok = self._cache_dicts_equal(kv_cache, prev_cache_out)
+                self.logger.info("PREFILL wiring: cache_in(t+1)==cache_out(t): %s", wiring_ok)
+
+            cache_in = kv_cache
+            logits, kv_cache = self._decoder_step(
+                token_id=tok,
+                pos=n,
+                kv_cache=kv_cache,
+                enc_cross_cache=enc_cross_cache,
+            )
+
+            if self.debug_kv and n < prompt_len:
+                layers_match, common_top_idx, global_max = self._cache_delta_summary(cache_in, kv_cache, n)
+                tok_str = self.tokenizer.decode([tok], skip_special_tokens=False)
+                self.logger.info(
+                    "PREFILL t=%d token=%d/%r pos=%d cache_delta: layers_match_pos=%d/%d common_top_idx=%d global_max=%s",
+                    n,
+                    tok,
+                    tok_str,
+                    n,
+                    layers_match,
+                    len(cache_in),
+                    common_top_idx,
+                    global_max,
                 )
 
-                if self.debug_kv:
-                    layers_match, common_top_idx, global_max = self._cache_delta_summary(cache_in, kv_cache, pos)
-                    tok_str = self.tokenizer.decode([tok], skip_special_tokens=False)
-                    self.logger.info(
-                        "PREFILL t=%d token=%d/%r pos=%d cache_delta: layers_match_pos=%d/%d common_top_idx=%d global_max=%s",
-                        pos,
-                        tok,
-                        tok_str,
-                        pos,
-                        layers_match,
-                        len(cache_in),
-                        common_top_idx,
-                        global_max,
-                    )
+            prev_cache_out = kv_cache
 
-                prev_cache_out = kv_cache
-                pos += 1
+            # Match HF behavior: generation begins once we consumed the last prompt token.
+            if n < output_length - 1:
                 continue
 
             if not generation_started:
-                remaining_positions = max(0, (self.attn_max_len - pos))
-                max_new_tokens = min(200, remaining_positions)
+                remaining_positions = max(0, (self.attn_max_len - (n + 1)))
                 self.logger.info(
                     "Decoder prefill done. pos=%d attn_max_len=%d -> max_new_tokens=%d",
-                    pos, self.attn_max_len, max_new_tokens
+                    n + 1,
+                    self.attn_max_len,
+                    remaining_positions,
                 )
                 generation_started = True
 
+            max_new_tokens = max(0, self.attn_max_len - output_length)
             if gen_step >= max_new_tokens:
                 break
 
             if self.debug_kv and gen_step % 10 == 0:
                 self.logger.info("Decoder gen step %d/%d", gen_step + 1, max_new_tokens)
 
-            if logits is None:
-                # Safety: compute logits for "next token" from last known token at previous position
-                last_tok = input_ids[-1]
-                logits, kv_cache = self._decoder_step(
-                    token_id=int(last_tok),
-                    pos=max(0, pos - 1),
-                    kv_cache=kv_cache,
-                    enc_cross_cache=enc_cross_cache,
+            if self.debug_kv and gen_step == 1:
+                top5_ids, top5_scores = self._topk_from_logits(logits, k=5)
+                top5_toks = [self.tokenizer.decode([int(tid)], skip_special_tokens=False) for tid in top5_ids]
+                self.logger.info(
+                    "GEN-STEP1 logits: top5_ids=%s top5_toks=%s top5_scores=%s",
+                    top5_ids,
+                    top5_toks,
+                    [float(s) for s in top5_scores],
                 )
 
             next_token = int(self._select_next_token_from_logits(logits))
@@ -399,37 +405,16 @@ class WhisperSmallQuantizedQNNSTT:
                 )
                 self.logger.info(
                     "GEN-STEP0 inputs: pos=%d input_id=%d/%r (from last prompt logits)",
-                    pos,
+                    n + 1,
                     next_token,
                     chosen_tok,
                 )
 
-            # If model ends immediately, stop.
-            if next_token == eot_token:
-                input_ids.append(next_token)
-                break
-
-            # IMPORTANT: next_token belongs to CURRENT pos
             input_ids.append(next_token)
 
-            logits, kv_cache = self._decoder_step(
-                token_id=next_token,
-                pos=pos,  # <-- correct position for this token
-                kv_cache=kv_cache,
-                enc_cross_cache=enc_cross_cache,
-            )
+            if next_token == eot_token:
+                break
 
-            if self.debug_kv and gen_step == 0:
-                top5_ids, top5_scores = self._topk_from_logits(logits, k=5)
-                top5_toks = [self.tokenizer.decode([int(tid)], skip_special_tokens=False) for tid in top5_ids]
-                self.logger.info(
-                    "GEN-STEP1 logits: top5_ids=%s top5_toks=%s top5_scores=%s",
-                    top5_ids,
-                    top5_toks,
-                    [float(s) for s in top5_scores],
-                )
-
-            pos += 1
             gen_step += 1
 
         return input_ids
