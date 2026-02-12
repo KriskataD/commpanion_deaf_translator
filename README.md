@@ -48,6 +48,13 @@ python -m src.translator --source-lang en --target-lang fr --once \
   --qnn-decoder-dir models/whisper_small_quantized_decoder_optimized_onnx
 ```
 
+Explicit STT profile selection examples:
+```bash
+python -m src.translator --once --stt-model small-quantized
+python -m src.translator --once --stt-model large-v3-turbo
+```
+You can still override model directories with `--qnn-encoder-dir` and `--qnn-decoder-dir`.
+
 To run the full pipeline:
 ```bash
 python -m src.wake_translation_assistant \
