@@ -174,7 +174,7 @@ class WhisperSmallQuantizedQNNSTT:
         return ["QNNExecutionProvider", "CPUExecutionProvider"]
 
     # --------------------------
-    # Public methods (dump_io, transcribe_wav)
+    # Public methods (dump_io, transcribe wrappers)
     # --------------------------
     def dump_io(self) -> None:
         print("\nEncoder inputs:")
@@ -191,27 +191,53 @@ class WhisperSmallQuantizedQNNSTT:
         for node in self.decoder_io.outputs:
             print(f"  - {node.name}: shape={node.shape}, type={node.type}")
 
-    def transcribe_wav(self, wav_path: Path, language: str | None = None) -> str:
-        self.logger.info("Starting QNN transcription: %s (language=%s)", wav_path, language or "auto")
+    def predict(self, *args: Any, **kwargs: Any) -> str:
+        return self.transcribe(*args, **kwargs)
 
+    def transcribe(
+        self,
+        audio: np.ndarray | str | Path,
+        audio_sample_rate: int | None = None,
+        language: str | None = None,
+    ) -> str:
         if self.debug:
             self._debug_logits_fallback_warned = False
+        tokens = self.transcribe_tokens(audio, audio_sample_rate=audio_sample_rate, language=language)
+        return self._final_decode_and_log(tokens)
 
-        audio = self._load_and_log_audio(Path(wav_path))
-        features = self._extract_and_pack_features(audio)
-        enc_cross_cache = self._run_encoder(features)
+    def transcribe_wav(self, wav_path: Path, language: str | None = None) -> str:
+        return self.transcribe(Path(wav_path), language=language)
 
-        prompt_ids = self._build_prompt_ids(language)
-        if self.debug:
-            self.logger.info("Prompt ids: %s", prompt_ids)
-            self.logger.info("Prompt tokens: %s", self.tokenizer.decode(prompt_ids, skip_special_tokens=False))
+    def transcribe_tokens(
+        self,
+        audio: np.ndarray | str | Path,
+        audio_sample_rate: int | None = None,
+        language: str | None = None,
+    ) -> list[int]:
+        if isinstance(audio, (str, Path)):
+            wav_path = Path(audio)
+            self.logger.info("Starting QNN transcription: %s (language=%s)", wav_path, language or "auto")
+            source_audio = self._load_and_log_audio(wav_path)
+            source_rate = 16000
+        else:
+            if audio_sample_rate is None:
+                raise ValueError("audio_sample_rate must be provided when audio is a numpy array.")
+            source_audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+            source_rate = int(audio_sample_rate)
+            self.logger.info(
+                "Starting QNN transcription from numpy audio: samples=%d sample_rate=%d (language=%s)",
+                source_audio.shape[0],
+                source_rate,
+                language or "auto",
+            )
 
-        if not prompt_ids:
-            raise RuntimeError("Prompt ids empty.")
-
-        input_ids = self._decoder_decode_single_loop(prompt_ids, enc_cross_cache)
-
-        return self._final_decode_and_log(input_ids)
+        chunks = self._chunk_and_resample_audio(source_audio, source_rate)
+        all_tokens: list[int] = []
+        for idx, chunk in enumerate(chunks):
+            self.logger.info("Transcribing chunk %d/%d (samples=%d)", idx + 1, len(chunks), chunk.shape[0])
+            chunk_tokens = self._transcribe_single_chunk(chunk, language=language)
+            all_tokens.extend(chunk_tokens)
+        return all_tokens
 
     # --------------------------
     # Transcribe pipeline helpers (audio load, mel, feature pack, encoder run, decoder prefill, decode loop)
@@ -237,6 +263,39 @@ class WhisperSmallQuantizedQNNSTT:
             self.logger.info("Encoder features min=%s max=%s", int(features.min()), int(features.max()))
         self.logger.info("Encoder features ready. Shape=%s, dtype=%s", features.shape, features.dtype)
         return features
+
+    def _transcribe_single_chunk(self, audio: np.ndarray, language: str | None = None) -> list[int]:
+        features = self._extract_and_pack_features(audio)
+        enc_cross_cache = self._run_encoder(features)
+
+        prompt_ids = self._build_prompt_ids(language)
+        if self.debug:
+            self.logger.info("Prompt ids: %s", prompt_ids)
+            self.logger.info("Prompt tokens: %s", self.tokenizer.decode(prompt_ids, skip_special_tokens=False))
+
+        if not prompt_ids:
+            raise RuntimeError("Prompt ids empty.")
+
+        return self._decoder_decode_single_loop(prompt_ids, enc_cross_cache)
+
+    def _chunk_and_resample_audio(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        model_sample_rate: int = 16000,
+        model_chunk_seconds: int = 30,
+    ) -> list[np.ndarray]:
+        if sample_rate != model_sample_rate:
+            audio = self._resample_audio(audio, sample_rate, model_sample_rate)
+
+        chunk_samples = max(1, int(model_sample_rate * model_chunk_seconds))
+        if audio.shape[0] <= chunk_samples:
+            return [audio]
+
+        chunks: list[np.ndarray] = []
+        for start in range(0, audio.shape[0], chunk_samples):
+            chunks.append(audio[start:start + chunk_samples])
+        return chunks
 
     def _run_encoder(self, features: np.ndarray) -> dict[str, np.ndarray]:
         # ----- encoder -> cross-cache outputs -----
@@ -530,7 +589,7 @@ class WhisperSmallQuantizedQNNSTT:
 
         return logits, new_cache
 
-    def _select_next_token_from_logits(self, logits: np.ndarray) -> int:
+    def _scores_with_suppression(self, logits: np.ndarray) -> np.ndarray:
         scores = self._logits_to_scores(logits)
 
         #eot = int(getattr(self.tokenizer, "eos_token_id", -1))
@@ -544,10 +603,14 @@ class WhisperSmallQuantizedQNNSTT:
                 if 0 <= tid < scores.shape[0]:
                     scores[tid] = -1e9
 
+        return scores
+
+    def _select_next_token_from_logits(self, logits: np.ndarray) -> int:
+        scores = self._scores_with_suppression(logits)
         return int(np.argmax(scores))
 
     def _topk_from_logits(self, logits: np.ndarray, k: int = 5) -> tuple[list[int], list[float]]:
-        scores = self._logits_to_scores(logits)
+        scores = self._scores_with_suppression(logits)
         top = np.argsort(scores)[-k:][::-1]
         return [int(i) for i in top], [float(scores[int(i)]) for i in top]
 
