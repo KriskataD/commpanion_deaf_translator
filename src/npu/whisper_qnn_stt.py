@@ -158,16 +158,6 @@ class WhisperSmallQuantizedQNNSTT:
         self.attn_max_len = int(self._get_input_shape_lastdim(self.decoder_attention_mask_name))  # 200
         self.self_cache_len = int(self._get_any_self_cache_len())  # 199
 
-        if self.debug:
-            self.logger.info("encoder_cross_cache_names=%d (first=%s)",
-                            len(self.encoder_cross_cache_names),
-                            self.encoder_cross_cache_names[:4])
-            self.logger.info("decoder_cross_cache_names=%d (first=%s)",
-                            len(self.decoder_cross_cache_names),
-                            self.decoder_cross_cache_names[:4])
-            self.logger.info("decoder_uses_cross_cache=%s", self.decoder_uses_cross_cache)
-
-
     # --------------------------
     # Providers
     # --------------------------
@@ -206,10 +196,6 @@ class WhisperSmallQuantizedQNNSTT:
 
         if self.debug:
             self._debug_logits_fallback_warned = False
-        if self.debug:
-            self._did_cross_ab = False          # run cross-attn A/B once per utterance
-            self._did_cross_stats = False       # run encoder cross-cache stats once per utterance
-
 
         audio = self._load_and_log_audio(Path(wav_path))
         features = self._extract_and_pack_features(audio)
@@ -259,24 +245,6 @@ class WhisperSmallQuantizedQNNSTT:
         t0 = time.perf_counter()
         enc_out = self.encoder_session.run(self.encoder_cross_cache_names, enc_inputs)
         self.logger.info("Encoder run returned in %.3fs", time.perf_counter() - t0)
-
-        if self.debug and not getattr(self, "_did_cross_stats", False):
-            self._did_cross_stats = True
-
-            if len(enc_out) == 0:
-                self.logger.warning("Encoder returned 0 cross-cache tensors!")
-            else:
-                k0 = enc_out[0]
-                self.logger.info("cross_cache[0] dtype=%s shape=%s min=%s max=%s",
-                                k0.dtype, k0.shape, int(np.min(k0)), int(np.max(k0)))
-
-                # If it's packed fp16 in uint16, view it as fp16 and inspect real values
-                if isinstance(k0, np.ndarray) and k0.dtype == np.uint16:
-                    f = k0.view(np.float16).astype(np.float32)
-                    self.logger.info("cross_cache[0] fp16 stats: finite=%.3f min=%f max=%f mean=%f",
-                                    float(np.isfinite(f).mean()),
-                                    float(np.min(f)), float(np.max(f)), float(np.mean(f)))
-
         return {n: v for n, v in zip(self.encoder_cross_cache_names, enc_out)}
 
     def _decoder_prefill(
@@ -306,8 +274,7 @@ class WhisperSmallQuantizedQNNSTT:
             )
 
             if self.debug_kv:
-                expected_idx = self.self_cache_len - (pos + 1)   # 198,197,...
-                layers_match, common_top_idx, global_max = self._cache_delta_summary(cache_in, kv_cache, expected_idx)
+                layers_match, common_top_idx, global_max = self._cache_delta_summary(cache_in, kv_cache, pos)
                 tok_str = self.tokenizer.decode([int(tok)], skip_special_tokens=False)
                 self.logger.info(
                     "PREFILL t=%d token=%d/%r pos=%d cache_delta: layers_match_pos=%d/%d common_top_idx=%d global_max=%s",
@@ -368,22 +335,24 @@ class WhisperSmallQuantizedQNNSTT:
                     enc_cross_cache=enc_cross_cache,
                 )
 
-            # --- wrapper-like token selection ---
-            scores = self._logits_to_scores(logits)
-
-            # Block EOT only for the FIRST generated token after the prompt
-            if step == 0:
-                if 0 <= eot_token < scores.shape[0]:
-                    scores[eot_token] = -1e9
-
-            # Apply your existing suppress list
-            if getattr(self, "suppress_tokens", None):
-                for tid in self.suppress_tokens:
-                    if 0 <= tid < scores.shape[0]:
-                        scores[tid] = -1e9
-
-            next_token = int(np.argmax(scores))
-
+            next_token = int(self._select_next_token_from_logits(logits))
+            if self.debug_kv and step == 0:
+                top5_ids, top5_scores = self._topk_from_logits(logits, k=5)
+                top5_toks = [self.tokenizer.decode([int(tid)], skip_special_tokens=False) for tid in top5_ids]
+                chosen_tok = self.tokenizer.decode([next_token], skip_special_tokens=False)
+                self.logger.info(
+                    "GEN-START from last-prompt logits: top5_ids=%s top5_toks=%s chosen_id=%d chosen_tok=%r",
+                    top5_ids,
+                    top5_toks,
+                    next_token,
+                    chosen_tok,
+                )
+                self.logger.info(
+                    "GEN-STEP0 inputs: pos=%d input_id=%d/%r (from last prompt logits)",
+                    pos,
+                    next_token,
+                    chosen_tok,
+                )
 
             # If model ends immediately, stop.
             if next_token == eot_token:
@@ -522,25 +491,18 @@ class WhisperSmallQuantizedQNNSTT:
 
         # attention_mask: [1,1,1,200] uint16 (plain values, not packed-fp16)
         #attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
-        mask_neg = np.float16(-100)  # safe fallback (typical Whisper additive mask)
         count = min(pos + 1, self.attn_max_len)
 
-        #attn_f16 = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.float16)
-        attn_f16 = np.full((1, 1, 1, self.attn_max_len), mask_neg, dtype=np.float16)
+        attn_f16 = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.float16)
 
         # Right-align active tokens so position_ids/kv cache line up with attention.
-        attn_f16[0, 0, 0, -count:] = np.float16(0.0)
+        attn_f16[0, 0, 0, -count:] = np.float16(1.0)
 
         decoder_inputs[self.decoder_attention_mask_name] = attn_f16.view(np.uint16)
 
         m = decoder_inputs[self.decoder_attention_mask_name]
         self.logger.info("attn_mask uint16 min=%d max=%d", int(m.min()), int(m.max()))
 
-        if self.debug:
-            self.logger.info(
-                "attn_mask fp16 stats: min=%f max=%f count=%d",
-                float(attn_f16.min()), float(attn_f16.max()), count
-            )
 
         # position_ids: [1] int32 (NOT [1,1])
         pid_dtype = self._dtype_for_input(self.decoder_position_ids_name, fallback=np.int32)
@@ -548,8 +510,6 @@ class WhisperSmallQuantizedQNNSTT:
         if pid < 0:
             pid = 0
         decoder_inputs[self.decoder_position_ids_name] = np.array([pid], dtype=pid_dtype)
-        #decoder_inputs[self.decoder_position_ids_name] = np.array([pos], dtype=pid_dtype)
-        #pid = pos  # only for logging
 
 
         # KV cache in (self)
@@ -571,48 +531,6 @@ class WhisperSmallQuantizedQNNSTT:
 
         output_map = {node.name: value for node, value in zip(self.decoder_io.outputs, outputs)}
         logits = output_map[self.decoder_logits_name]
-
-        x = np.ascontiguousarray(np.squeeze(logits)).reshape(-1)  # uint16
-        scores_fp16 = x.view(np.float16).astype(np.float32)
-        scores_i16  = x.view(np.int16).astype(np.float32)
-
-        top_fp16 = int(np.nanargmax(scores_fp16))
-        top_i16  = int(np.argmax(scores_i16))
-
-        self.logger.info(
-            "LOGITS VIEW TEST: top_fp16=%d tok=%r score=%f | top_i16=%d tok=%r score=%f",
-            top_fp16, self.tokenizer.decode([top_fp16], skip_special_tokens=False), float(scores_fp16[top_fp16]),
-            top_i16,  self.tokenizer.decode([top_i16],  skip_special_tokens=False), float(scores_i16[top_i16]),
-        )
-
-        # ---- CROSS-ATTN A/B TEST (run once) ----
-        if self.debug and self.decoder_uses_cross_cache and not getattr(self, "_did_cross_ab", False):
-            self._did_cross_ab = True
-
-            # scores from REAL logits
-            s_real = self._logits_to_scores(logits)
-
-            # Build inputs with ZEROED cross-cache
-            dec_zero = dict(decoder_inputs)
-            # safer to use discovered decoder cross-cache names (these are INPUT names)
-            for name in self.decoder_cross_cache_names:
-                if name in dec_zero:
-                    dec_zero[name] = np.zeros_like(dec_zero[name])
-
-            out_zero = self.decoder_session.run([self.decoder_logits_name], dec_zero)[0]
-            s_zero = self._logits_to_scores(out_zero)
-
-            delta = np.abs(s_real - s_zero)
-            self.logger.info("CROSS EFFECT: max|Δ|=%.3f  mean|Δ|=%.3f",
-                            float(np.max(delta)), float(np.mean(delta)))
-
-            # also show if top token changes
-            top_real = int(np.argmax(s_real))
-            top_zero = int(np.argmax(s_zero))
-            self.logger.info("CROSS TOP: real=%d %r | zero=%d %r",
-                            top_real, self.tokenizer.decode([top_real], skip_special_tokens=False),
-                            top_zero, self.tokenizer.decode([top_zero], skip_special_tokens=False))
-
 
         # Update KV cache from *_out
         if self.has_kv_cache:
@@ -695,19 +613,21 @@ class WhisperSmallQuantizedQNNSTT:
         x = np.ascontiguousarray(np.squeeze(logits)).reshape(-1)
 
         if x.dtype == np.uint16:
-            fp = x.view(np.float16).astype(np.float32)
-            finite = np.isfinite(fp)
-            finite_ratio = float(finite.mean()) if fp.size else 1.0
+            scores = x.view(np.float16).astype(np.float32)
+            finite_ratio = float(np.isfinite(scores).mean()) if scores.size else 1.0
 
-            # if fp16 view looks broken, fall back to int16 view
             if finite_ratio < 0.99:
-                i16 = x.view(np.int16).astype(np.float32)
-                return i16
+                if self.debug and not getattr(self, "_debug_logits_fallback_warned", False):
+                    self._debug_logits_fallback_warned = True
+                    self.logger.warning(
+                        "Decoded fp16 logits have low finite ratio (%.2f%%); falling back to uint16->float32 interpretation.",
+                        finite_ratio * 100.0,
+                    )
+                return x.astype(np.float32)
 
-            # fp16 view seems plausible; just sanitize tiny remnants
-            return np.nan_to_num(fp, nan=-1e9, posinf=1e9, neginf=-1e9)
+            return scores
 
-        return np.nan_to_num(x.astype(np.float32), nan=-1e9, posinf=1e9, neginf=-1e9)
+        return x.astype(np.float32)
 
     # --------------------------
     # IO discovery helpers
