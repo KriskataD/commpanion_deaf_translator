@@ -623,7 +623,7 @@ class WhisperQnnSTT:
 
         if self.profile.name == "large-v3-turbo":
             attn = np.full((1, 1, 1, self.attn_max_len), np.float16(-65504.0), dtype=np.float16)
-            attn[0, 0, 0, -count:] = np.float16(0.0)
+            attn[0, 0, 0, :count] = np.float16(0.0)
             decoder_inputs[self.decoder_attention_mask_name] = attn
             if self.debug:
                 self.logger.info("attn_mask float16 min=%.1f max=%.1f", float(attn.min()), float(attn.max()))
@@ -636,7 +636,12 @@ class WhisperQnnSTT:
 
         # position_ids: [1] int32 (NOT [1,1])
         pid_dtype = self._dtype_for_input(self.decoder_position_ids_name, fallback=np.int32)
-        pid = self.self_cache_len - count
+        if self.profile.name == "large-v3-turbo":
+            # IMPORTANT: turbo expects FORWARD positions
+            pid = count - 1   # == pos unless clipped
+        else:
+            # small-quantized expects REVERSE positions
+            pid = self.self_cache_len - count
         decoder_inputs[self.decoder_position_ids_name] = np.array([pid], dtype=pid_dtype)
 
 
