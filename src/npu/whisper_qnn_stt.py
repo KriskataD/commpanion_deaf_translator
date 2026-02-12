@@ -438,14 +438,23 @@ class WhisperSmallQuantizedQNNSTT:
         return feats.astype(np.float32)
 
     def _prepare_encoder_features(self, features: np.ndarray) -> np.ndarray:
-        # Encoder expects uint16, and this is the only input we pack from float16 bits.
+        """
+        Encoder expects quantized uint16 because model has:
+        input_features -> DequantizeLinear(scale, zero_point)
+        So we must QUANTIZE float features into uint16, not pack float16 bits.
+        """
         node = self.encoder_io.inputs[0]
         t = (node.type or "").lower()
 
         if "uint16" in t:
-            # ✅ pack float16 bits into uint16 (same idea as your logits handling)
-            packed = features.astype(np.float16).view(np.uint16)
-            return packed
+            # From your ONNX inspection:
+            scale = np.float32(4.677007018472068e-05)
+            zp    = np.uint16(32072)
+
+            x = features.astype(np.float32)
+            q = np.rint(x / scale + float(zp)).astype(np.int64)
+            q = np.clip(q, 0, 65535).astype(np.uint16)
+            return q
 
         # fallback
         return features.astype(np.float32)
@@ -493,12 +502,10 @@ class WhisperSmallQuantizedQNNSTT:
         #attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
         count = min(pos + 1, self.attn_max_len)
 
-        attn_f16 = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.float16)
+        attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
+        attn[0, 0, 0, -count:] = np.uint16(65535)   # left-aligned “valid”
+        decoder_inputs[self.decoder_attention_mask_name] = attn
 
-        # Right-align active tokens so position_ids/kv cache line up with attention.
-        attn_f16[0, 0, 0, -count:] = np.float16(1.0)
-
-        decoder_inputs[self.decoder_attention_mask_name] = attn_f16.view(np.uint16)
 
         m = decoder_inputs[self.decoder_attention_mask_name]
         self.logger.info("attn_mask uint16 min=%d max=%d", int(m.min()), int(m.max()))
@@ -506,9 +513,7 @@ class WhisperSmallQuantizedQNNSTT:
 
         # position_ids: [1] int32 (NOT [1,1])
         pid_dtype = self._dtype_for_input(self.decoder_position_ids_name, fallback=np.int32)
-        pid = self.self_cache_len - count   # 199,198,197,... for pos=0,1,2...
-        if pid < 0:
-            pid = 0
+        pid = self.self_cache_len - count   # 198,197,196,...
         decoder_inputs[self.decoder_position_ids_name] = np.array([pid], dtype=pid_dtype)
 
 
@@ -542,7 +547,8 @@ class WhisperSmallQuantizedQNNSTT:
 
     def _select_next_token_from_logits(self, logits: np.ndarray) -> int:
         scores = self._logits_to_scores(logits)
-
+        self.logger.info("scores stats: min=%.4f max=%.4f", float(scores.min()), float(scores.max()))
+        
         #eot = int(getattr(self.tokenizer, "eos_token_id", -1))
         #if getattr(self, "_block_eot_steps", 0) > 0 and 0 <= eot < scores.shape[0]:
         #    scores[eot] = -1e9
@@ -613,18 +619,11 @@ class WhisperSmallQuantizedQNNSTT:
         x = np.ascontiguousarray(np.squeeze(logits)).reshape(-1)
 
         if x.dtype == np.uint16:
-            scores = x.view(np.float16).astype(np.float32)
-            finite_ratio = float(np.isfinite(scores).mean()) if scores.size else 1.0
+            # From your decoder graph inspection:
+            scale = np.float32(0.0012925398768857121)
+            zp    = np.float32(17867.0)
 
-            if finite_ratio < 0.99:
-                if self.debug and not getattr(self, "_debug_logits_fallback_warned", False):
-                    self._debug_logits_fallback_warned = True
-                    self.logger.warning(
-                        "Decoded fp16 logits have low finite ratio (%.2f%%); falling back to uint16->float32 interpretation.",
-                        finite_ratio * 100.0,
-                    )
-                return x.astype(np.float32)
-
+            scores = (x.astype(np.float32) - zp) * scale
             return scores
 
         return x.astype(np.float32)
