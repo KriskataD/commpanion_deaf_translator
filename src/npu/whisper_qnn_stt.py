@@ -1,4 +1,4 @@
-"""Whisper Small Quantized STT using ONNX Runtime + QNN Execution Provider."""
+"""Whisper QNN STT using ONNX Runtime + QNN Execution Provider."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -57,8 +57,90 @@ class SessionIoInfo:
     outputs: list[ort.NodeArg]
 
 
-class WhisperSmallQuantizedQNNSTT:
-    """Run Whisper Small Quantized (encoder+decoder) with ONNX Runtime QNN."""
+@dataclass(frozen=True)
+class SttProfile:
+    name: str
+    hf_id: str
+    n_mels: int
+    encoder_input_dtype: np.dtype
+    attention_mask_dtype: np.dtype
+    mask_style: str
+    logits_dtype: np.dtype
+    pid_style: str
+
+
+SMALL_QUANT_PROFILE = SttProfile(
+    name="small-quantized",
+    hf_id="openai/whisper-small",
+    n_mels=80,
+    encoder_input_dtype=np.uint16,
+    attention_mask_dtype=np.uint16,
+    mask_style="small-quantized",
+    logits_dtype=np.uint16,
+    pid_style="reverse",
+)
+
+TURBO_PROFILE = SttProfile(
+    name="large-v3-turbo",
+    hf_id="openai/whisper-large-v3-turbo",
+    n_mels=128,
+    encoder_input_dtype=np.float16,
+    attention_mask_dtype=np.float16,
+    mask_style="additive-f16",
+    logits_dtype=np.float16,
+    pid_style="reverse",
+)
+
+
+def _ort_type_to_np_dtype(ort_type: str) -> np.dtype | None:
+    t = (ort_type or "").lower()
+    if "uint8" in t:
+        return np.uint8
+    if "uint16" in t:
+        return np.uint16
+    if "int32" in t:
+        return np.int32
+    if "int64" in t:
+        return np.int64
+    if "float16" in t:
+        return np.float16
+    if "float" in t:
+        return np.float32
+    return None
+
+
+def detect_profile(
+    encoder_session: ort.InferenceSession,
+    decoder_session: ort.InferenceSession,
+    encoder_io: SessionIoInfo,
+    decoder_io: SessionIoInfo,
+) -> SttProfile:
+    _ = encoder_session, decoder_session
+    enc_input = next((n for n in encoder_io.inputs if "input_features" in n.name.lower()), None)
+    if enc_input is None:
+        raise RuntimeError("Unable to detect STT profile: encoder input_features not found.")
+
+    enc_dtype = _ort_type_to_np_dtype(enc_input.type or "")
+    enc_shape = tuple(enc_input.shape or [])
+    mel_dim = int(enc_shape[1]) if len(enc_shape) > 1 and isinstance(enc_shape[1], int) else None
+
+    dec_logits = next((n for n in decoder_io.outputs if "logits" in n.name.lower()), None)
+    logits_dtype = dec_logits.type if dec_logits is not None else "unknown"
+
+    if enc_dtype == np.float16 and mel_dim == 128:
+        return TURBO_PROFILE
+    if enc_dtype == np.uint16 and mel_dim == 80:
+        return SMALL_QUANT_PROFILE
+
+    raise RuntimeError(
+        "Unable to detect STT profile from model IO. "
+        f"encoder input_features dtype={enc_input.type}, shape={enc_shape}; "
+        f"decoder logits dtype={logits_dtype}."
+    )
+
+
+class WhisperQnnSTT:
+    """Run Whisper QNN STT (small-quantized or large-v3-turbo) with ONNX Runtime QNN."""
 
     # --------------------------
     # Class init: validation, sessions, IO discovery, model config/tokenizer init
@@ -67,12 +149,14 @@ class WhisperSmallQuantizedQNNSTT:
         self,
         encoder_dir: str | Path,
         decoder_dir: str | Path,
+        stt_model: str = "auto",
         prefer_qnn: bool = True,
         debug: bool = False,
     ) -> None:
         self.logger = logging.getLogger(__name__)
         self.encoder_dir = Path(encoder_dir)
         self.decoder_dir = Path(decoder_dir)
+        self.stt_model = stt_model
         self.prefer_qnn = prefer_qnn
         self.debug = debug
         self.debug_kv = debug
@@ -80,6 +164,7 @@ class WhisperSmallQuantizedQNNSTT:
         self._resolve_model_paths_and_validate()
         self._create_sessions()
         self._init_io_info()
+        self._select_profile()
         self._init_feature_extractor_and_tokenizer()
         self._discover_io_names_and_cache_metadata()
 
@@ -90,6 +175,34 @@ class WhisperSmallQuantizedQNNSTT:
                 "attn_max_len=%d self_cache_len=%d has_kv_cache=%s",
                 self.attn_max_len, self.self_cache_len, self.has_kv_cache
             )
+
+    def _select_profile(self) -> None:
+        if self.stt_model == "auto":
+            self.profile = detect_profile(
+                self.encoder_session,
+                self.decoder_session,
+                self.encoder_io,
+                self.decoder_io,
+            )
+        elif self.stt_model == "small-quantized":
+            self.profile = SMALL_QUANT_PROFILE
+        elif self.stt_model == "large-v3-turbo":
+            self.profile = TURBO_PROFILE
+        else:
+            raise ValueError(f"Unsupported stt_model={self.stt_model!r}")
+
+        encoder_node = self.encoder_io.inputs[0] if self.encoder_io.inputs else None
+        attention_node = next((n for n in self.decoder_io.inputs if "attention_mask" in n.name.lower()), None)
+        logits_node = next((n for n in self.decoder_io.outputs if "logits" in n.name.lower()), None)
+        self.logger.info(
+            "Selected STT profile: name=%s hf_id=%s n_mels=%d encoder_dtype=%s mask_dtype=%s logits_dtype=%s",
+            self.profile.name,
+            self.profile.hf_id,
+            self.profile.n_mels,
+            encoder_node.type if encoder_node is not None else "unknown",
+            attention_node.type if attention_node is not None else "unknown",
+            logits_node.type if logits_node is not None else "unknown",
+        )
 
     def _resolve_model_paths_and_validate(self) -> None:
         self.encoder_onnx = self.encoder_dir / "model.onnx"
@@ -125,9 +238,16 @@ class WhisperSmallQuantizedQNNSTT:
                 self.logger.info("OUT %-35s shape=%s type=%s", node.name, node.shape, node.type)
 
     def _init_feature_extractor_and_tokenizer(self) -> None:
-        self.feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small")
-        self.tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small")
-        self.config = WhisperConfig.from_pretrained("openai/whisper-small")
+        if self.profile.name == "large-v3-turbo":
+            self.feature_extractor = WhisperFeatureExtractor(
+                feature_size=self.profile.n_mels,
+                sampling_rate=16000,
+            )
+        else:
+            self.feature_extractor = WhisperFeatureExtractor.from_pretrained(self.profile.hf_id)
+
+        self.tokenizer = WhisperTokenizer.from_pretrained(self.profile.hf_id)
+        self.config = WhisperConfig.from_pretrained(self.profile.hf_id)
         self.suppress_tokens = set(self.config.suppress_tokens or [])
 
     def _discover_io_names_and_cache_metadata(self) -> None:
@@ -434,17 +554,18 @@ class WhisperSmallQuantizedQNNSTT:
             audio,
             sampling_rate=16000,
             return_tensors="np"
-        ).input_features  # float32, shape (1, 80, 3000)
+        ).input_features
         return feats.astype(np.float32)
 
     def _prepare_encoder_features(self, features: np.ndarray) -> np.ndarray:
         """
-        Encoder expects quantized uint16 because model has:
-        input_features -> DequantizeLinear(scale, zero_point)
-        So we must QUANTIZE float features into uint16, not pack float16 bits.
+        Preserve small-quantized packing exactly; turbo uses float16 features directly.
         """
         node = self.encoder_io.inputs[0]
         t = (node.type or "").lower()
+
+        if self.profile.name == "large-v3-turbo":
+            return features.astype(np.float16)
 
         if "uint16" in t:
             # From your ONNX inspection:
@@ -498,22 +619,24 @@ class WhisperSmallQuantizedQNNSTT:
         input_ids_dtype = self._dtype_for_input(self.decoder_input_ids_name, fallback=np.int32)
         decoder_inputs[self.decoder_input_ids_name] = np.array([[token_id]], dtype=input_ids_dtype)
 
-        # attention_mask: [1,1,1,200] uint16 (plain values, not packed-fp16)
-        #attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
         count = min(pos + 1, self.attn_max_len)
 
-        attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
-        attn[0, 0, 0, -count:] = np.uint16(65535)   # left-aligned “valid”
-        decoder_inputs[self.decoder_attention_mask_name] = attn
-
-
-        m = decoder_inputs[self.decoder_attention_mask_name]
-        self.logger.info("attn_mask uint16 min=%d max=%d", int(m.min()), int(m.max()))
-
+        if self.profile.name == "large-v3-turbo":
+            attn = np.full((1, 1, 1, self.attn_max_len), np.float16(-65504.0), dtype=np.float16)
+            attn[0, 0, 0, -count:] = np.float16(0.0)
+            decoder_inputs[self.decoder_attention_mask_name] = attn
+            if self.debug:
+                self.logger.info("attn_mask float16 min=%.1f max=%.1f", float(attn.min()), float(attn.max()))
+        else:
+            # attention_mask: [1,1,1,200] uint16 (plain values, not packed-fp16)
+            attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
+            attn[0, 0, 0, -count:] = np.uint16(65535)
+            decoder_inputs[self.decoder_attention_mask_name] = attn
+            self.logger.info("attn_mask uint16 min=%d max=%d", int(attn.min()), int(attn.max()))
 
         # position_ids: [1] int32 (NOT [1,1])
         pid_dtype = self._dtype_for_input(self.decoder_position_ids_name, fallback=np.int32)
-        pid = self.self_cache_len - count   # 198,197,196,...
+        pid = self.self_cache_len - count
         decoder_inputs[self.decoder_position_ids_name] = np.array([pid], dtype=pid_dtype)
 
 
@@ -669,11 +792,18 @@ class WhisperSmallQuantizedQNNSTT:
         return int(node.shape[-1])
 
     def _get_any_self_cache_len(self) -> int:
-        # use first self cache input to infer length (199)
+        # Infer robustly from a self-cache tensor by matching attn_max_len-1 on any axis.
+        expected = max(0, int(self.attn_max_len) - 1)
         for n in self.decoder_io.inputs:
             if "cache_self" in n.name.lower() and n.name.lower().endswith("_in"):
-                if n.shape and isinstance(n.shape[-1], int):
-                    return int(n.shape[-1])
+                if not n.shape:
+                    continue
+                for dim in n.shape:
+                    if isinstance(dim, int) and int(dim) == expected:
+                        return int(dim)
+                for dim in n.shape:
+                    if isinstance(dim, int) and int(dim) > 1:
+                        return int(dim)
         raise RuntimeError("Unable to infer self cache length from decoder inputs.")
 
     # --------------------------
@@ -745,3 +875,41 @@ class WhisperSmallQuantizedQNNSTT:
         if "float" in t:
             return np.float32
         return np.float32
+
+
+class WhisperSmallQuantizedQNNSTT(WhisperQnnSTT):
+    """Backward-compatible wrapper for the small quantized Whisper profile."""
+
+    def __init__(
+        self,
+        encoder_dir: str | Path,
+        decoder_dir: str | Path,
+        prefer_qnn: bool = True,
+        debug: bool = False,
+    ) -> None:
+        super().__init__(
+            encoder_dir=encoder_dir,
+            decoder_dir=decoder_dir,
+            stt_model="small-quantized",
+            prefer_qnn=prefer_qnn,
+            debug=debug,
+        )
+
+
+class WhisperLargeV3TurboQNNSTT(WhisperQnnSTT):
+    """Convenience wrapper for the large-v3-turbo Whisper profile."""
+
+    def __init__(
+        self,
+        encoder_dir: str | Path,
+        decoder_dir: str | Path,
+        prefer_qnn: bool = True,
+        debug: bool = False,
+    ) -> None:
+        super().__init__(
+            encoder_dir=encoder_dir,
+            decoder_dir=decoder_dir,
+            stt_model="large-v3-turbo",
+            prefer_qnn=prefer_qnn,
+            debug=debug,
+        )

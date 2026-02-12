@@ -18,7 +18,7 @@ from typing import Callable, Optional
 import torch
 from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
 
-from .npu.whisper_qnn_stt import WhisperSmallQuantizedQNNSTT
+from .npu.whisper_qnn_stt import WhisperQnnSTT
 from .recorder import AudioRecorder
 from .tts import _TTS
 
@@ -63,6 +63,7 @@ class TranslatorPipeline:
         speak: bool = True,
         qnn_encoder_dir: str | Path = "models/whisper_small_quantized_encoder_optimized_onnx",
         qnn_decoder_dir: str | Path = "models/whisper_small_quantized_decoder_optimized_onnx",
+        stt_model: str = "auto",
         stt_timeout: float | None = None,
         tts_timeout: float | None = None,
     ) -> None:
@@ -72,6 +73,7 @@ class TranslatorPipeline:
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.speak = speak
+        self.stt_model = stt_model
         self.stt_timeout = stt_timeout
         self.tts_timeout = tts_timeout
 
@@ -135,9 +137,10 @@ class TranslatorPipeline:
         encoder_dir, decoder_dir = self._resolve_qnn_model_dirs(qnn_encoder_dir, qnn_decoder_dir)
         self.logger.info("QNN encoder directory: %s", encoder_dir)
         self.logger.info("QNN decoder directory: %s", decoder_dir)
-        return WhisperSmallQuantizedQNNSTT(
+        return WhisperQnnSTT(
             encoder_dir=encoder_dir,
             decoder_dir=decoder_dir,
+            stt_model=self.stt_model,
             debug=True,
         )
 
@@ -264,6 +267,12 @@ def main() -> None:
         help="Directory containing the QNN Whisper decoder ONNX model (or set QNN_DECODER_DIR).",
     )
     parser.add_argument(
+        "--stt-model",
+        default="auto",
+        choices=["auto", "small-quantized", "large-v3-turbo"],
+        help="Which Whisper STT backend profile to use.",
+    )
+    parser.add_argument(
         "--stt-timeout",
         type=float,
         help="Optional timeout (seconds) for STT transcription to avoid hangs.",
@@ -282,6 +291,16 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    default_small_encoder = "models/whisper_small_quantized_encoder_optimized_onnx"
+    default_small_decoder = "models/whisper_small_quantized_decoder_optimized_onnx"
+    if (
+        args.stt_model == "large-v3-turbo"
+        and args.qnn_encoder_dir == default_small_encoder
+        and args.qnn_decoder_dir == default_small_decoder
+    ):
+        args.qnn_encoder_dir = "models/whisper_large_v3_turbo_encoder_optimized_onnx"
+        args.qnn_decoder_dir = "models/whisper_large_v3_turbo_decoder_optimized_onnx"
+
     pipeline = TranslatorPipeline(
         audio_dir=args.audio_dir,
         source_lang=args.source_lang,
@@ -289,6 +308,7 @@ def main() -> None:
         speak=not args.no_speak,
         qnn_encoder_dir=args.qnn_encoder_dir,
         qnn_decoder_dir=args.qnn_decoder_dir,
+        stt_model=args.stt_model,
         stt_timeout=args.stt_timeout,
     )
 

@@ -26,6 +26,7 @@ class WakeWordTranslationAssistant:
         target_lang: str = "fr",
         qnn_encoder_dir: Path | str = "models/whisper_small_quantized_encoder_optimized_onnx",
         qnn_decoder_dir: Path | str = "models/whisper_small_quantized_decoder_optimized_onnx",
+        stt_model: str = "auto",
         wakeword_models: list[str] | None = None,
         wakeword_threshold: float = 0.25,
         wakeword_device_index: int | None = None,
@@ -49,6 +50,7 @@ class WakeWordTranslationAssistant:
             speak=speak,
             qnn_encoder_dir=qnn_encoder_dir,
             qnn_decoder_dir=qnn_decoder_dir,
+            stt_model=stt_model,
             stt_timeout=stt_timeout,
             tts_timeout=tts_timeout,
         )
@@ -354,6 +356,12 @@ def main() -> None:
         help="Directory containing the QNN Whisper decoder ONNX model (or set QNN_DECODER_DIR).",
     )
     parser.add_argument(
+        "--stt-model",
+        default="auto",
+        choices=["auto", "small-quantized", "large-v3-turbo"],
+        help="Which Whisper STT backend profile to use.",
+    )
+    parser.add_argument(
         "--wakeword",
         action="append",
         help="Wake word model(s) to load (defaults to openWakeWord's hey_jarvis).",
@@ -413,6 +421,7 @@ def main() -> None:
         target_lang=args.target_lang,
         qnn_encoder_dir=args.qnn_encoder_dir,
         qnn_decoder_dir=args.qnn_decoder_dir,
+        stt_model=args.stt_model,
         wakeword_models=args.wakeword,
         wakeword_threshold=args.wake_threshold,
         wakeword_device_index=args.wake_mic_index,
