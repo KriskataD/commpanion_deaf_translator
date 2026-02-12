@@ -410,7 +410,7 @@ class WhisperQnnSTT:
 
             prev_cache_out = kv_cache
             pos += 1
-            if pos >= self.attn_max_len:
+            if pos >= self.self_cache_len:
                 break
 
         # Now generate new tokens
@@ -430,12 +430,12 @@ class WhisperQnnSTT:
             raise RuntimeError("Tokenizer eos_token_id missing.")
 
         # pos currently == len(prompt_ids)  (next position index to be generated)
-        remaining_positions = max(0, (self.attn_max_len - pos))
+        remaining_positions = max(0, (self.self_cache_len - pos))
         max_new_tokens = min(200, remaining_positions)
 
         self.logger.info(
-            "Decoder prefill done. pos=%d attn_max_len=%d -> max_new_tokens=%d",
-            pos, self.attn_max_len, max_new_tokens
+            "Decoder prefill done. pos=%d self_cache_len=%d attn_max_len=%d -> max_new_tokens=%d",
+            pos, self.self_cache_len, self.attn_max_len, max_new_tokens
         )
 
         # self._block_eot_steps = 8   # Fix 4: block EOS/EOT for first N generation selections
@@ -500,7 +500,7 @@ class WhisperQnnSTT:
                 )
 
             pos += 1
-            if pos >= self.attn_max_len:
+            if pos >= self.self_cache_len:
                 break
 
         return input_ids
@@ -619,7 +619,7 @@ class WhisperQnnSTT:
         input_ids_dtype = self._dtype_for_input(self.decoder_input_ids_name, fallback=np.int32)
         decoder_inputs[self.decoder_input_ids_name] = np.array([[token_id]], dtype=input_ids_dtype)
 
-        count = min(pos + 1, self.attn_max_len)
+        count = min(pos + 1, self.self_cache_len)
 
         if self.profile.name == "large-v3-turbo":
             attn = np.full((1, 1, 1, self.attn_max_len), np.float16(-65504.0), dtype=np.float16)
