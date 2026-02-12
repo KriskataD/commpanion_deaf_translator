@@ -174,7 +174,7 @@ class WhisperSmallQuantizedQNNSTT:
         return ["QNNExecutionProvider", "CPUExecutionProvider"]
 
     # --------------------------
-    # Public methods (dump_io, transcribe wrappers)
+    # Public methods (dump_io, transcribe_wav)
     # --------------------------
     def dump_io(self) -> None:
         print("\nEncoder inputs:")
@@ -191,53 +191,28 @@ class WhisperSmallQuantizedQNNSTT:
         for node in self.decoder_io.outputs:
             print(f"  - {node.name}: shape={node.shape}, type={node.type}")
 
-    def predict(self, *args: Any, **kwargs: Any) -> str:
-        return self.transcribe(*args, **kwargs)
+    def transcribe_wav(self, wav_path: Path, language: str | None = None) -> str:
+        self.logger.info("Starting QNN transcription: %s (language=%s)", wav_path, language or "auto")
 
-    def transcribe(
-        self,
-        audio: np.ndarray | str | Path,
-        audio_sample_rate: int | None = None,
-        language: str | None = None,
-    ) -> str:
         if self.debug:
             self._debug_logits_fallback_warned = False
-        tokens = self.transcribe_tokens(audio, audio_sample_rate=audio_sample_rate, language=language)
-        return self._final_decode_and_log(tokens)
 
-    def transcribe_wav(self, wav_path: Path, language: str | None = None) -> str:
-        return self.transcribe(Path(wav_path), language=language)
+        audio = self._load_and_log_audio(Path(wav_path))
+        features = self._extract_and_pack_features(audio)
+        enc_cross_cache = self._run_encoder(features)
 
-    def transcribe_tokens(
-        self,
-        audio: np.ndarray | str | Path,
-        audio_sample_rate: int | None = None,
-        language: str | None = None,
-    ) -> list[int]:
-        if isinstance(audio, (str, Path)):
-            wav_path = Path(audio)
-            self.logger.info("Starting QNN transcription: %s (language=%s)", wav_path, language or "auto")
-            source_audio = self._load_and_log_audio(wav_path)
-            source_rate = 16000
-        else:
-            if audio_sample_rate is None:
-                raise ValueError("audio_sample_rate must be provided when audio is a numpy array.")
-            source_audio = np.asarray(audio, dtype=np.float32).reshape(-1)
-            source_rate = int(audio_sample_rate)
-            self.logger.info(
-                "Starting QNN transcription from numpy audio: samples=%d sample_rate=%d (language=%s)",
-                source_audio.shape[0],
-                source_rate,
-                language or "auto",
-            )
+        prompt_ids = self._build_prompt_ids(language)
+        if self.debug:
+            self.logger.info("Prompt ids: %s", prompt_ids)
+            self.logger.info("Prompt tokens: %s", self.tokenizer.decode(prompt_ids, skip_special_tokens=False))
 
-        chunks = self._chunk_and_resample_audio(source_audio, source_rate)
-        all_tokens: list[int] = []
-        for idx, chunk in enumerate(chunks):
-            self.logger.info("Transcribing chunk %d/%d (samples=%d)", idx + 1, len(chunks), chunk.shape[0])
-            chunk_tokens = self._transcribe_single_chunk(chunk, language=language)
-            all_tokens.extend(chunk_tokens)
-        return all_tokens
+        if not prompt_ids:
+            raise RuntimeError("Prompt ids empty.")
+
+        logits, kv_cache, pos, input_ids = self._decoder_prefill(prompt_ids, enc_cross_cache)
+        input_ids = self._decoder_generate(logits, kv_cache, pos, input_ids, enc_cross_cache)
+
+        return self._final_decode_and_log(input_ids)
 
     # --------------------------
     # Transcribe pipeline helpers (audio load, mel, feature pack, encoder run, decoder prefill, decode loop)
@@ -264,39 +239,6 @@ class WhisperSmallQuantizedQNNSTT:
         self.logger.info("Encoder features ready. Shape=%s, dtype=%s", features.shape, features.dtype)
         return features
 
-    def _transcribe_single_chunk(self, audio: np.ndarray, language: str | None = None) -> list[int]:
-        features = self._extract_and_pack_features(audio)
-        enc_cross_cache = self._run_encoder(features)
-
-        prompt_ids = self._build_prompt_ids(language)
-        if self.debug:
-            self.logger.info("Prompt ids: %s", prompt_ids)
-            self.logger.info("Prompt tokens: %s", self.tokenizer.decode(prompt_ids, skip_special_tokens=False))
-
-        if not prompt_ids:
-            raise RuntimeError("Prompt ids empty.")
-
-        return self._decoder_decode_single_loop(prompt_ids, enc_cross_cache)
-
-    def _chunk_and_resample_audio(
-        self,
-        audio: np.ndarray,
-        sample_rate: int,
-        model_sample_rate: int = 16000,
-        model_chunk_seconds: int = 30,
-    ) -> list[np.ndarray]:
-        if sample_rate != model_sample_rate:
-            audio = self._resample_audio(audio, sample_rate, model_sample_rate)
-
-        chunk_samples = max(1, int(model_sample_rate * model_chunk_seconds))
-        if audio.shape[0] <= chunk_samples:
-            return [audio]
-
-        chunks: list[np.ndarray] = []
-        for start in range(0, audio.shape[0], chunk_samples):
-            chunks.append(audio[start:start + chunk_samples])
-        return chunks
-
     def _run_encoder(self, features: np.ndarray) -> dict[str, np.ndarray]:
         # ----- encoder -> cross-cache outputs -----
         enc_inputs = {self.encoder_input_name: features}
@@ -305,53 +247,41 @@ class WhisperSmallQuantizedQNNSTT:
         self.logger.info("Encoder run returned in %.3fs", time.perf_counter() - t0)
         return {n: v for n, v in zip(self.encoder_cross_cache_names, enc_out)}
 
-    def _decoder_decode_single_loop(
+    def _decoder_prefill(
         self,
         prompt_ids: list[int],
         enc_cross_cache: dict[str, np.ndarray],
-    ) -> list[int]:
+    ) -> tuple[np.ndarray | None, dict[str, np.ndarray], int, list[int]]:
+        # KV cache init
         kv_cache = self._initialize_kv_cache() if self.has_kv_cache else {}
-        input_ids: list[int] = prompt_ids.copy()
-        prompt_len = len(prompt_ids)
 
-        eot_token = int(getattr(self.tokenizer, "eos_token_id", -1))
-        if eot_token < 0:
-            raise RuntimeError("Tokenizer eos_token_id missing.")
-
-        output_length = len(input_ids)
+        # Prefill each prompt token sequentially (because input_ids is [1,1])
+        # This warms the self-cache and produces logits for the next token.
+        logits = None
+        pos = 0
         prev_cache_out: dict[str, np.ndarray] | None = None
-        generation_started = False
-        gen_step = 0
-
-        # Keep sequence semantics close to HF wrapper: consume token at index n,
-        # then optionally append argmax token when n reaches generation boundary.
-        for n in range(max(0, self.attn_max_len - 1)):
-            if n >= len(input_ids):
-                break
-
-            tok = int(input_ids[n])
-
-            if self.debug_kv and n < prompt_len and prev_cache_out is not None:
+        for t, tok in enumerate(prompt_ids):
+            if self.debug_kv and prev_cache_out is not None:
                 wiring_ok = self._cache_dicts_equal(kv_cache, prev_cache_out)
                 self.logger.info("PREFILL wiring: cache_in(t+1)==cache_out(t): %s", wiring_ok)
 
             cache_in = kv_cache
             logits, kv_cache = self._decoder_step(
-                token_id=tok,
-                pos=n,
+                token_id=int(tok),
+                pos=pos,
                 kv_cache=kv_cache,
                 enc_cross_cache=enc_cross_cache,
             )
 
-            if self.debug_kv and n < prompt_len:
-                layers_match, common_top_idx, global_max = self._cache_delta_summary(cache_in, kv_cache, n)
-                tok_str = self.tokenizer.decode([tok], skip_special_tokens=False)
+            if self.debug_kv:
+                layers_match, common_top_idx, global_max = self._cache_delta_summary(cache_in, kv_cache, pos)
+                tok_str = self.tokenizer.decode([int(tok)], skip_special_tokens=False)
                 self.logger.info(
                     "PREFILL t=%d token=%d/%r pos=%d cache_delta: layers_match_pos=%d/%d common_top_idx=%d global_max=%s",
-                    n,
-                    tok,
+                    t,
+                    int(tok),
                     tok_str,
-                    n,
+                    pos,
                     layers_match,
                     len(cache_in),
                     common_top_idx,
@@ -359,40 +289,54 @@ class WhisperSmallQuantizedQNNSTT:
                 )
 
             prev_cache_out = kv_cache
-
-            # Match HF behavior: generation begins once we consumed the last prompt token.
-            if n < output_length - 1:
-                continue
-
-            if not generation_started:
-                remaining_positions = max(0, (self.attn_max_len - (n + 1)))
-                self.logger.info(
-                    "Decoder prefill done. pos=%d attn_max_len=%d -> max_new_tokens=%d",
-                    n + 1,
-                    self.attn_max_len,
-                    remaining_positions,
-                )
-                generation_started = True
-
-            max_new_tokens = max(0, self.attn_max_len - output_length)
-            if gen_step >= max_new_tokens:
+            pos += 1
+            if pos >= self.attn_max_len:
                 break
 
-            if self.debug_kv and gen_step % 10 == 0:
-                self.logger.info("Decoder gen step %d/%d", gen_step + 1, max_new_tokens)
+        # Now generate new tokens
+        input_ids: list[int] = prompt_ids.copy()
+        return logits, kv_cache, pos, input_ids
 
-            if self.debug_kv and gen_step == 1:
-                top5_ids, top5_scores = self._topk_from_logits(logits, k=5)
-                top5_toks = [self.tokenizer.decode([int(tid)], skip_special_tokens=False) for tid in top5_ids]
-                self.logger.info(
-                    "GEN-STEP1 logits: top5_ids=%s top5_toks=%s top5_scores=%s",
-                    top5_ids,
-                    top5_toks,
-                    [float(s) for s in top5_scores],
+    def _decoder_generate(
+        self,
+        logits: np.ndarray | None,
+        kv_cache: dict[str, np.ndarray],
+        pos: int,
+        input_ids: list[int],
+        enc_cross_cache: dict[str, np.ndarray],
+    ) -> list[int]:
+        eot_token = int(getattr(self.tokenizer, "eos_token_id", -1))
+        if eot_token < 0:
+            raise RuntimeError("Tokenizer eos_token_id missing.")
+
+        # pos currently == len(prompt_ids)  (next position index to be generated)
+        remaining_positions = max(0, (self.attn_max_len - pos))
+        max_new_tokens = min(200, remaining_positions)
+
+        self.logger.info(
+            "Decoder prefill done. pos=%d attn_max_len=%d -> max_new_tokens=%d",
+            pos, self.attn_max_len, max_new_tokens
+        )
+
+        # self._block_eot_steps = 8   # Fix 4: block EOS/EOT for first N generation selections
+
+        # We already have logits from the last prefill step (unless prompt was empty)
+        for step in range(max_new_tokens):
+            if self.debug_kv and step % 10 == 0:
+                self.logger.info("Decoder gen step %d/%d", step + 1, max_new_tokens)
+
+            if logits is None:
+                # Safety: compute logits for "next token" from last known token at previous position
+                last_tok = input_ids[-1]
+                logits, kv_cache = self._decoder_step(
+                    token_id=int(last_tok),
+                    pos=max(0, pos - 1),
+                    kv_cache=kv_cache,
+                    enc_cross_cache=enc_cross_cache,
                 )
 
             next_token = int(self._select_next_token_from_logits(logits))
-            if self.debug_kv and gen_step == 0:
+            if self.debug_kv and step == 0:
                 top5_ids, top5_scores = self._topk_from_logits(logits, k=5)
                 top5_toks = [self.tokenizer.decode([int(tid)], skip_special_tokens=False) for tid in top5_ids]
                 chosen_tok = self.tokenizer.decode([next_token], skip_special_tokens=False)
@@ -405,17 +349,39 @@ class WhisperSmallQuantizedQNNSTT:
                 )
                 self.logger.info(
                     "GEN-STEP0 inputs: pos=%d input_id=%d/%r (from last prompt logits)",
-                    n + 1,
+                    pos,
                     next_token,
                     chosen_tok,
                 )
 
-            input_ids.append(next_token)
-
+            # If model ends immediately, stop.
             if next_token == eot_token:
+                input_ids.append(next_token)
                 break
 
-            gen_step += 1
+            # IMPORTANT: next_token belongs to CURRENT pos
+            input_ids.append(next_token)
+
+            logits, kv_cache = self._decoder_step(
+                token_id=next_token,
+                pos=pos,  # <-- correct position for this token
+                kv_cache=kv_cache,
+                enc_cross_cache=enc_cross_cache,
+            )
+
+            if self.debug_kv and step == 0:
+                top5_ids, top5_scores = self._topk_from_logits(logits, k=5)
+                top5_toks = [self.tokenizer.decode([int(tid)], skip_special_tokens=False) for tid in top5_ids]
+                self.logger.info(
+                    "GEN-STEP1 logits: top5_ids=%s top5_toks=%s top5_scores=%s",
+                    top5_ids,
+                    top5_toks,
+                    [float(s) for s in top5_scores],
+                )
+
+            pos += 1
+            if pos >= self.attn_max_len:
+                break
 
         return input_ids
 
@@ -574,7 +540,7 @@ class WhisperSmallQuantizedQNNSTT:
 
         return logits, new_cache
 
-    def _scores_with_suppression(self, logits: np.ndarray) -> np.ndarray:
+    def _select_next_token_from_logits(self, logits: np.ndarray) -> int:
         scores = self._logits_to_scores(logits)
 
         #eot = int(getattr(self.tokenizer, "eos_token_id", -1))
@@ -588,14 +554,10 @@ class WhisperSmallQuantizedQNNSTT:
                 if 0 <= tid < scores.shape[0]:
                     scores[tid] = -1e9
 
-        return scores
-
-    def _select_next_token_from_logits(self, logits: np.ndarray) -> int:
-        scores = self._scores_with_suppression(logits)
         return int(np.argmax(scores))
 
     def _topk_from_logits(self, logits: np.ndarray, k: int = 5) -> tuple[list[int], list[float]]:
-        scores = self._scores_with_suppression(logits)
+        scores = self._logits_to_scores(logits)
         top = np.argsort(scores)[-k:][::-1]
         return [int(i) for i in top], [float(scores[int(i)]) for i in top]
 
