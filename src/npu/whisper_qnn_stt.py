@@ -580,6 +580,50 @@ class WhisperQnnSTT:
                         input_ids.append(eot_token)
                     break
 
+            if self.enable_repeat_guards:
+                generated_ids = input_ids[prompt_len:]
+                loop_detected, diversity, tail_unique = self._looks_like_loop(
+                    generated_ids=generated_ids,
+                    window=self.loop_window,
+                    tail=self.loop_tail,
+                    diversity_thr=self.loop_diversity_threshold,
+                )
+                compression_suspect = False
+                if self.enable_compression_guard and (loop_detected or (step + 1) % self.compression_check_interval == 0):
+                    tail_text = self.tokenizer.decode(generated_ids[-80:], skip_special_tokens=True)[-600:]
+                    compression_ratio = self._compression_ratio(tail_text)
+                    compression_suspect = compression_ratio > self.compression_ratio_threshold
+                else:
+                    tail_text = self.tokenizer.decode(generated_ids[-80:], skip_special_tokens=True)[-600:]
+                    compression_ratio = 0.0
+
+                self.logger.info(
+                    "RepeatGuard step=%d diversity=%.3f banned_count=%d tail='%s'",
+                    step,
+                    diversity,
+                    banned_count,
+                    tail_text.replace("\n", " ")[:120],
+                )
+
+                if loop_detected or compression_suspect:
+                    self._loop_hit_count += 1
+                else:
+                    self._loop_hit_count = 0
+
+                if self._loop_hit_count >= self.loop_hits_to_stop:
+                    warning_msg = (
+                        "⚠️ REPETITION LOOP DETECTED: stopping decode early "
+                        f"step={step} diversity={diversity:.3f} tail_unique={tail_unique} "
+                        f"banned_count={banned_count} compression_ratio={compression_ratio:.2f}"
+                    )
+                    self.logger.warning(warning_msg)
+                    self.logger.warning("RepeatGuard tail snippet: %s", tail_text.replace("\n", " ")[:200])
+                    print(f"⚠️ [RepeatGuard] Loop detected at step={step}, forcing EOT.")
+                    print(f"⚠️ [RepeatGuard] Tail snippet: {tail_text.replace(chr(10), ' ')[:200]}")
+                    if input_ids[-1] != eot_token:
+                        input_ids.append(eot_token)
+                    break
+
             logits, kv_cache = self._decoder_step(
                 token_id=next_token,
                 pos=pos,  # <-- correct position for this token
