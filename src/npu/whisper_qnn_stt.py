@@ -261,6 +261,7 @@ class WhisperQnnSTT:
         self.enable_compression_guard = True
         self.compression_ratio_threshold = 2.2
         self.compression_check_interval = 10
+        self.min_loop_check_tokens = 12
         self._loop_hit_count = 0
 
     def _discover_io_names_and_cache_metadata(self) -> None:
@@ -618,10 +619,11 @@ class WhisperQnnSTT:
         tail: int,
         diversity_thr: float,
     ) -> tuple[bool, float, int]:
-        if len(generated_ids) < window:
+        min_tokens = max(self.min_loop_check_tokens, max(1, tail) * 2)
+        if len(generated_ids) < min_tokens:
             return False, 1.0, len(set(generated_ids[-tail:])) if generated_ids else 0
 
-        recent = generated_ids[-window:]
+        recent = generated_ids[-min(window, len(generated_ids)):]
         tail_ids = recent[-tail:] if tail > 0 else recent
         diversity = len(set(recent)) / max(1, len(recent))
         tail_unique = len(set(tail_ids))
@@ -630,8 +632,25 @@ class WhisperQnnSTT:
         cond_low_diversity = diversity < diversity_thr
         bigrams = list(zip(recent, recent[1:]))
         cond_cycle = len(set(bigrams)) < max(6, len(bigrams) // 6)
+        cond_tail_repeat = self._has_repeating_tail_cycle(tail_ids)
 
-        return (cond_tail_stuck or cond_low_diversity or cond_cycle), diversity, tail_unique
+        return (cond_tail_stuck or cond_low_diversity or cond_cycle or cond_tail_repeat), diversity, tail_unique
+
+    def _has_repeating_tail_cycle(self, tail_ids: list[int]) -> bool:
+        if len(tail_ids) < 6:
+            return False
+
+        max_cycle = min(8, len(tail_ids) // 3)
+        for cycle_len in range(1, max_cycle + 1):
+            pattern = tail_ids[-cycle_len:]
+            repeats = 1
+            idx = len(tail_ids) - cycle_len
+            while idx - cycle_len >= 0 and tail_ids[idx - cycle_len:idx] == pattern:
+                repeats += 1
+                idx -= cycle_len
+                if repeats >= 3:
+                    return True
+        return False
 
     def _compression_ratio(self, text: str) -> float:
         if not text:
