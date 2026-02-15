@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import gzip
 import zlib
 import logging
 import os
@@ -253,12 +252,15 @@ class WhisperQnnSTT:
         self.suppress_tokens = set(self.config.suppress_tokens or [])
 
         # Anti-repetition guards for greedy decoding.
-        self.no_repeat_ngram_size = 3
+        self.no_repeat_ngram_size = 4
         self.loop_window = 48
         self.loop_tail = 16
         self.loop_diversity_threshold = 0.18
-        self.loop_hits_to_stop = 2
+        self.loop_hits_to_stop = 1
         self.enable_repeat_guards = True
+        self.enable_freq_penalty = True
+        self.freq_penalty = 0.35
+        self.freq_window = 64
         self.enable_compression_guard = True
         self.compression_ratio_threshold = 2.2
         self.compression_check_interval = 10
@@ -455,8 +457,6 @@ class WhisperQnnSTT:
             pos, self.self_cache_len, self.attn_max_len, max_new_tokens
         )
 
-        # self._block_eot_steps = 8   # Fix 4: block EOS/EOT for first N generation selections
-
         # We already have logits from the last prefill step (unless prompt was empty)
         for step in range(max_new_tokens):
             banned_count = 0
@@ -483,14 +483,17 @@ class WhisperQnnSTT:
                     if 0 <= tid < scores.shape[0]:
                         scores[tid] = -1e9
 
+            generated_ids = input_ids[prompt_len:]
             if self.enable_repeat_guards:
-                generated_ids = input_ids[prompt_len:]
                 banned_count = self._apply_no_repeat_ngrams(
                     scores=scores,
                     generated_ids=generated_ids,
                     n=self.no_repeat_ngram_size,
                     eos_id=eot_token,
                 )
+
+            if self.enable_freq_penalty:
+                self._apply_frequency_penalty(scores, generated_ids, eot_token)
 
             next_token = int(np.argmax(scores))
             if self.debug_kv and step == 0:
@@ -518,6 +521,64 @@ class WhisperQnnSTT:
 
             # IMPORTANT: next_token belongs to CURRENT pos
             input_ids.append(next_token)
+            generated_ids = input_ids[prompt_len:]
+
+            # lightweight terminal heartbeat (every 10 steps only)
+            if (step + 1) % 10 == 0:
+                last_text = self.tokenizer.decode(generated_ids[-12:], skip_special_tokens=True).replace("\n", " ").strip()
+                print(f"[DECODER] step={step + 1} pos={pos} last='{last_text[:100]}'")
+
+            if self.enable_repeat_guards:
+                loop_detected, diversity, tail_unique = self._looks_like_loop(
+                    generated_ids=generated_ids,
+                    window=self.loop_window,
+                    tail=self.loop_tail,
+                    diversity_thr=self.loop_diversity_threshold,
+                )
+                tok_dom, bi_dom = self._dominance(generated_ids, window=64)
+                if tok_dom > 0.40 or bi_dom > 0.30:
+                    loop_detected = True
+
+                tail_text = self.tokenizer.decode(generated_ids[-80:], skip_special_tokens=True)[-600:]
+                compression_ratio = 0.0
+                compression_suspect = False
+                if self.enable_compression_guard and (loop_detected or (step + 1) % self.compression_check_interval == 0):
+                    compression_ratio = self._compression_ratio(tail_text)
+                    compression_suspect = compression_ratio > self.compression_ratio_threshold
+
+                self.logger.info(
+                    "RepeatGuard step=%d diversity=%.3f banned_count=%d tok_dom=%.3f bi_dom=%.3f tail='%s'",
+                    step,
+                    diversity,
+                    banned_count,
+                    tok_dom,
+                    bi_dom,
+                    tail_text.replace("\n", " ")[:120],
+                )
+
+                if loop_detected or compression_suspect:
+                    self._loop_hit_count += 1
+                    print(
+                        "⚠️ [RepeatGuard] loop-suspect "
+                        f"step={step} tok_dom={tok_dom:.2f} bi_dom={bi_dom:.2f} comp={compression_ratio:.2f}"
+                    )
+                else:
+                    self._loop_hit_count = 0
+
+                if self._loop_hit_count >= self.loop_hits_to_stop:
+                    warning_msg = (
+                        "⚠️ REPETITION LOOP DETECTED: stopping decode early "
+                        f"step={step} diversity={diversity:.3f} tail_unique={tail_unique} "
+                        f"tok_dom={tok_dom:.3f} bi_dom={bi_dom:.3f} "
+                        f"compression_ratio={compression_ratio:.2f} banned_count={banned_count}"
+                    )
+                    self.logger.warning(warning_msg)
+                    self.logger.warning("RepeatGuard tail snippet: %s", tail_text.replace("\n", " ")[:200])
+                    print(f"⚠️ [RepeatGuard] Loop detected at step={step}, forcing EOT.")
+                    print(f"⚠️ [RepeatGuard] tail='{tail_text.replace(chr(10), ' ')[:200]}'")
+                    if input_ids[-1] != eot_token:
+                        input_ids.append(eot_token)
+                    break
 
             if self.enable_repeat_guards:
                 generated_ids = input_ids[prompt_len:]
@@ -613,6 +674,37 @@ class WhisperQnnSTT:
 
         return len(banned)
 
+    def _apply_frequency_penalty(
+        self,
+        scores: np.ndarray,
+        generated_ids: list[int],
+        eos_id: int,
+    ) -> None:
+        if not generated_ids:
+            return
+        recent = generated_ids[-max(1, int(self.freq_window)):]
+        token_counts = Counter(recent)
+        for token_id, count in token_counts.items():
+            if token_id == eos_id:
+                continue
+            if 0 <= int(token_id) < scores.shape[0]:
+                scores[int(token_id)] -= float(self.freq_penalty) * int(count)
+
+    def _dominance(self, ids: list[int], window: int = 64) -> tuple[float, float]:
+        if not ids:
+            return 0.0, 0.0
+        recent = ids[-max(1, window):]
+        token_counts = Counter(recent)
+        tok_dom = max(token_counts.values()) / max(1, len(recent))
+
+        if len(recent) < 2:
+            return float(tok_dom), 0.0
+
+        bigrams = list(zip(recent, recent[1:]))
+        bigram_counts = Counter(bigrams)
+        bi_dom = max(bigram_counts.values()) / max(1, len(bigrams))
+        return float(tok_dom), float(bi_dom)
+
     def _looks_like_loop(
         self,
         generated_ids: list[int],
@@ -657,10 +749,10 @@ class WhisperQnnSTT:
         if not text:
             return 0.0
         raw = text.encode("utf-8", errors="ignore")
-        if len(raw) < 80:     # too short to be meaningful
+        if len(raw) < 120:
             return 0.0
-        comp = zlib.compress(raw)
-        return len(raw) / max(1, len(comp))
+        compressed = zlib.compress(raw)
+        return len(raw) / max(1, len(compressed))
 
     def _final_decode_and_log(self, input_ids: list[int]) -> str:
         decoded_raw = self.tokenizer.decode(input_ids, skip_special_tokens=False).strip()
