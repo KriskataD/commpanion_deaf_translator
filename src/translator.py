@@ -55,14 +55,19 @@ class MultiLanguageTranslator:
 class TranslatorPipeline:
     """End-to-end pipeline: record -> transcribe -> translate -> speak/print."""
 
+    DEFAULT_SMALL_ENCODER_DIR = "models/whisper_small_quantized_encoder_optimized_onnx"
+    DEFAULT_SMALL_DECODER_DIR = "models/whisper_small_quantized_decoder_optimized_onnx"
+    DEFAULT_TURBO_ENCODER_DIR = "models/whisper_large_v3_turbo_encoder_optimized_onnx"
+    DEFAULT_TURBO_DECODER_DIR = "models/whisper_large_v3_turbo_decoder_optimized_onnx"
+
     def __init__(
         self,
         audio_dir: str | Path = "audio",
         source_lang: str = "en",
         target_lang: str = "fr",
         speak: bool = True,
-        qnn_encoder_dir: str | Path = "models/whisper_small_quantized_encoder_optimized_onnx",
-        qnn_decoder_dir: str | Path = "models/whisper_small_quantized_decoder_optimized_onnx",
+        qnn_encoder_dir: str | Path = DEFAULT_SMALL_ENCODER_DIR,
+        qnn_decoder_dir: str | Path = DEFAULT_SMALL_DECODER_DIR,
         stt_model: str = "auto",
         stt_timeout: float | None = None,
         tts_timeout: float | None = None,
@@ -79,6 +84,7 @@ class TranslatorPipeline:
 
         self.logger = logging.getLogger(__name__)
         self.recorder = AudioRecorder()
+        qnn_encoder_dir, qnn_decoder_dir = self._select_qnn_model_dirs(qnn_encoder_dir, qnn_decoder_dir)
         self.stt = self._build_stt_backend(qnn_encoder_dir, qnn_decoder_dir)
         self.translator = MultiLanguageTranslator()
         self.tts = _TTS() if self.speak else None
@@ -132,6 +138,22 @@ class TranslatorPipeline:
         finally:
             if delete:
                 self.delete_last_audio_file()
+
+    def _select_qnn_model_dirs(
+        self,
+        qnn_encoder_dir: str | Path,
+        qnn_decoder_dir: str | Path,
+    ) -> tuple[str | Path, str | Path]:
+        if self.stt_model != "large-v3-turbo":
+            return qnn_encoder_dir, qnn_decoder_dir
+
+        if (
+            Path(qnn_encoder_dir) == Path(self.DEFAULT_SMALL_ENCODER_DIR)
+            and Path(qnn_decoder_dir) == Path(self.DEFAULT_SMALL_DECODER_DIR)
+        ):
+            return self.DEFAULT_TURBO_ENCODER_DIR, self.DEFAULT_TURBO_DECODER_DIR
+
+        return qnn_encoder_dir, qnn_decoder_dir
 
     def _build_stt_backend(self, qnn_encoder_dir: str | Path, qnn_decoder_dir: str | Path):
         encoder_dir, decoder_dir = self._resolve_qnn_model_dirs(qnn_encoder_dir, qnn_decoder_dir)
@@ -290,16 +312,6 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-
-    default_small_encoder = "models/whisper_small_quantized_encoder_optimized_onnx"
-    default_small_decoder = "models/whisper_small_quantized_decoder_optimized_onnx"
-    if (
-        args.stt_model == "large-v3-turbo"
-        and args.qnn_encoder_dir == default_small_encoder
-        and args.qnn_decoder_dir == default_small_decoder
-    ):
-        args.qnn_encoder_dir = "models/whisper_large_v3_turbo_encoder_optimized_onnx"
-        args.qnn_decoder_dir = "models/whisper_large_v3_turbo_decoder_optimized_onnx"
 
     pipeline = TranslatorPipeline(
         audio_dir=args.audio_dir,
