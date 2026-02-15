@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import gzip
+import zlib
 import logging
 import os
 from pathlib import Path
@@ -528,11 +529,11 @@ class WhisperQnnSTT:
                 )
                 compression_suspect = False
                 if self.enable_compression_guard and (loop_detected or (step + 1) % self.compression_check_interval == 0):
-                    tail_text = self.tokenizer.decode(generated_ids[-30:], skip_special_tokens=True)[-200:]
+                    tail_text = self.tokenizer.decode(generated_ids[-80:], skip_special_tokens=True)[-600:]
                     compression_ratio = self._compression_ratio(tail_text)
                     compression_suspect = compression_ratio > self.compression_ratio_threshold
                 else:
-                    tail_text = self.tokenizer.decode(generated_ids[-30:], skip_special_tokens=True)[-200:]
+                    tail_text = self.tokenizer.decode(generated_ids[-80:], skip_special_tokens=True)[-600:]
                     compression_ratio = 0.0
 
                 self.logger.info(
@@ -656,8 +657,10 @@ class WhisperQnnSTT:
         if not text:
             return 0.0
         raw = text.encode("utf-8", errors="ignore")
-        compressed = gzip.compress(raw)
-        return len(raw) / max(1, len(compressed))
+        if len(raw) < 80:     # too short to be meaningful
+            return 0.0
+        comp = zlib.compress(raw)
+        return len(raw) / max(1, len(comp))
 
     def _final_decode_and_log(self, input_ids: list[int]) -> str:
         decoded_raw = self.tokenizer.decode(input_ids, skip_special_tokens=False).strip()
