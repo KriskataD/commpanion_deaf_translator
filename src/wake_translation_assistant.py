@@ -415,6 +415,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    default_small_encoder = "models/whisper_small_quantized_encoder_optimized_onnx"
+    default_small_decoder = "models/whisper_small_quantized_decoder_optimized_onnx"
+    if (
+        args.stt_model == "large-v3-turbo"
+        and args.qnn_encoder_dir == default_small_encoder
+        and args.qnn_decoder_dir == default_small_decoder
+    ):
+        args.qnn_encoder_dir = "models/whisper_large_v3_turbo_encoder_optimized_onnx"
+        args.qnn_decoder_dir = "models/whisper_large_v3_turbo_decoder_optimized_onnx"
+
     assistant = WakeWordTranslationAssistant(
         audio_dir=args.audio_dir,
         source_lang=args.source_lang,
