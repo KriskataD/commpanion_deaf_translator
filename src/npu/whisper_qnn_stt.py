@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import gzip
 import logging
 import os
 from pathlib import Path
@@ -250,6 +251,19 @@ class WhisperQnnSTT:
         self.config = WhisperConfig.from_pretrained(self.profile.hf_id)
         self.suppress_tokens = set(self.config.suppress_tokens or [])
 
+        # Anti-repetition guards for greedy decoding.
+        self.no_repeat_ngram_size = 3
+        self.loop_window = 48
+        self.loop_tail = 16
+        self.loop_diversity_threshold = 0.18
+        self.loop_hits_to_stop = 2
+        self.enable_repeat_guards = True
+        self.enable_compression_guard = True
+        self.compression_ratio_threshold = 2.2
+        self.compression_check_interval = 10
+        self.min_loop_check_tokens = 12
+        self._loop_hit_count = 0
+
     def _discover_io_names_and_cache_metadata(self) -> None:
         # Names from IO
         self.encoder_input_name = self._must_find(self.encoder_io.inputs, ["input_features"])
@@ -428,6 +442,8 @@ class WhisperQnnSTT:
         eot_token = int(getattr(self.tokenizer, "eos_token_id", -1))
         if eot_token < 0:
             raise RuntimeError("Tokenizer eos_token_id missing.")
+        self._loop_hit_count = 0
+        prompt_len = len(input_ids)
 
         # pos currently == len(prompt_ids)  (next position index to be generated)
         remaining_positions = max(0, (self.self_cache_len - pos))
@@ -442,6 +458,7 @@ class WhisperQnnSTT:
 
         # We already have logits from the last prefill step (unless prompt was empty)
         for step in range(max_new_tokens):
+            banned_count = 0
             if self.debug_kv and step % 10 == 0:
                 self.logger.info("Decoder gen step %d/%d", step + 1, max_new_tokens)
 
@@ -455,7 +472,26 @@ class WhisperQnnSTT:
                     enc_cross_cache=enc_cross_cache,
                 )
 
-            next_token = int(self._select_next_token_from_logits(logits))
+            scores = self._logits_to_scores(logits)
+
+            # Suppress Whisper control/special tokens, but never suppress EOS/EOT.
+            if getattr(self, "suppress_tokens", None):
+                for tid in self.suppress_tokens:
+                    if tid == eot_token:
+                        continue
+                    if 0 <= tid < scores.shape[0]:
+                        scores[tid] = -1e9
+
+            if self.enable_repeat_guards:
+                generated_ids = input_ids[prompt_len:]
+                banned_count = self._apply_no_repeat_ngrams(
+                    scores=scores,
+                    generated_ids=generated_ids,
+                    n=self.no_repeat_ngram_size,
+                    eos_id=eot_token,
+                )
+
+            next_token = int(np.argmax(scores))
             if self.debug_kv and step == 0:
                 top5_ids, top5_scores = self._topk_from_logits(logits, k=5)
                 top5_toks = [self.tokenizer.decode([int(tid)], skip_special_tokens=False) for tid in top5_ids]
@@ -482,6 +518,50 @@ class WhisperQnnSTT:
             # IMPORTANT: next_token belongs to CURRENT pos
             input_ids.append(next_token)
 
+            if self.enable_repeat_guards:
+                generated_ids = input_ids[prompt_len:]
+                loop_detected, diversity, tail_unique = self._looks_like_loop(
+                    generated_ids=generated_ids,
+                    window=self.loop_window,
+                    tail=self.loop_tail,
+                    diversity_thr=self.loop_diversity_threshold,
+                )
+                compression_suspect = False
+                if self.enable_compression_guard and (loop_detected or (step + 1) % self.compression_check_interval == 0):
+                    tail_text = self.tokenizer.decode(generated_ids[-30:], skip_special_tokens=True)[-200:]
+                    compression_ratio = self._compression_ratio(tail_text)
+                    compression_suspect = compression_ratio > self.compression_ratio_threshold
+                else:
+                    tail_text = self.tokenizer.decode(generated_ids[-30:], skip_special_tokens=True)[-200:]
+                    compression_ratio = 0.0
+
+                self.logger.info(
+                    "RepeatGuard step=%d diversity=%.3f banned_count=%d tail='%s'",
+                    step,
+                    diversity,
+                    banned_count,
+                    tail_text.replace("\n", " ")[:120],
+                )
+
+                if loop_detected or compression_suspect:
+                    self._loop_hit_count += 1
+                else:
+                    self._loop_hit_count = 0
+
+                if self._loop_hit_count >= self.loop_hits_to_stop:
+                    warning_msg = (
+                        "⚠️ REPETITION LOOP DETECTED: stopping decode early "
+                        f"step={step} diversity={diversity:.3f} tail_unique={tail_unique} "
+                        f"banned_count={banned_count} compression_ratio={compression_ratio:.2f}"
+                    )
+                    self.logger.warning(warning_msg)
+                    self.logger.warning("RepeatGuard tail snippet: %s", tail_text.replace("\n", " ")[:200])
+                    print(f"⚠️ [RepeatGuard] Loop detected at step={step}, forcing EOT.")
+                    print(f"⚠️ [RepeatGuard] Tail snippet: {tail_text.replace(chr(10), ' ')[:200]}")
+                    if input_ids[-1] != eot_token:
+                        input_ids.append(eot_token)
+                    break
+
             logits, kv_cache = self._decoder_step(
                 token_id=next_token,
                 pos=pos,  # <-- correct position for this token
@@ -504,6 +584,80 @@ class WhisperQnnSTT:
                 break
 
         return input_ids
+
+    def _apply_no_repeat_ngrams(
+        self,
+        scores: np.ndarray,
+        generated_ids: list[int],
+        n: int,
+        eos_id: int,
+    ) -> int:
+        if n <= 1 or len(generated_ids) < n - 1:
+            return 0
+
+        prefix = tuple(generated_ids[-(n - 1):])
+        banned: set[int] = set()
+        for i in range(0, len(generated_ids) - n + 1):
+            if tuple(generated_ids[i:i + n - 1]) == prefix:
+                next_idx = i + n - 1
+                if 0 <= next_idx < len(generated_ids):
+                    banned.add(int(generated_ids[next_idx]))
+
+        if eos_id in banned:
+            banned.remove(eos_id)
+
+        for token_id in banned:
+            if 0 <= token_id < scores.shape[0]:
+                scores[token_id] = -1e9
+
+        return len(banned)
+
+    def _looks_like_loop(
+        self,
+        generated_ids: list[int],
+        window: int,
+        tail: int,
+        diversity_thr: float,
+    ) -> tuple[bool, float, int]:
+        min_tokens = max(self.min_loop_check_tokens, max(1, tail) * 2)
+        if len(generated_ids) < min_tokens:
+            return False, 1.0, len(set(generated_ids[-tail:])) if generated_ids else 0
+
+        recent = generated_ids[-min(window, len(generated_ids)):]
+        tail_ids = recent[-tail:] if tail > 0 else recent
+        diversity = len(set(recent)) / max(1, len(recent))
+        tail_unique = len(set(tail_ids))
+
+        cond_tail_stuck = tail_unique <= 2
+        cond_low_diversity = diversity < diversity_thr
+        bigrams = list(zip(recent, recent[1:]))
+        cond_cycle = len(set(bigrams)) < max(6, len(bigrams) // 6)
+        cond_tail_repeat = self._has_repeating_tail_cycle(tail_ids)
+
+        return (cond_tail_stuck or cond_low_diversity or cond_cycle or cond_tail_repeat), diversity, tail_unique
+
+    def _has_repeating_tail_cycle(self, tail_ids: list[int]) -> bool:
+        if len(tail_ids) < 6:
+            return False
+
+        max_cycle = min(8, len(tail_ids) // 3)
+        for cycle_len in range(1, max_cycle + 1):
+            pattern = tail_ids[-cycle_len:]
+            repeats = 1
+            idx = len(tail_ids) - cycle_len
+            while idx - cycle_len >= 0 and tail_ids[idx - cycle_len:idx] == pattern:
+                repeats += 1
+                idx -= cycle_len
+                if repeats >= 3:
+                    return True
+        return False
+
+    def _compression_ratio(self, text: str) -> float:
+        if not text:
+            return 0.0
+        raw = text.encode("utf-8", errors="ignore")
+        compressed = gzip.compress(raw)
+        return len(raw) / max(1, len(compressed))
 
     def _final_decode_and_log(self, input_ids: list[int]) -> str:
         decoded_raw = self.tokenizer.decode(input_ids, skip_special_tokens=False).strip()
