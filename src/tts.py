@@ -16,12 +16,35 @@ except ImportError:  # pragma: no cover - only needed on Windows
 
 CHUNK_REGEX = re.compile(r".*?[\.!?…](?:\s|$)")  # Regex to match complete sentence-like segments
 
+import json, socket
+
+class CaptionClient:
+    def __init__(self, host: str = "127.0.0.1", port: int = 37777) -> None:
+        self.addr = (host, port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setblocking(False)
+
+    def set_text(self, text: str) -> None:
+        try:
+            payload = {"text": text, "clear": False}
+            self.sock.sendto(json.dumps(payload, ensure_ascii=False).encode("utf-8"), self.addr)
+        except Exception:
+            # Never break TTS if captions fail
+            pass
+
+    def clear(self) -> None:
+        try:
+            payload = {"text": "", "clear": True}
+            self.sock.sendto(json.dumps(payload).encode("utf-8"), self.addr)
+        except Exception:
+            pass
+
 class _TTS:
     """
     A wrapper around the pyttsx3 engine to convert text to speech, used to vocalize complete sentences.
     """
 
-    def __init__(self, rate: int = 1):
+    def __init__(self, rate: int = 1, enable_captions: bool = True, captions_port: int = 37777):
         """
         Initialize the pyttsx3 text-to-speech engine.
 
@@ -36,6 +59,7 @@ class _TTS:
         self._queue: Queue[tuple[str, float | None, threading.Event]] = Queue()
         self._worker_thread = threading.Thread(target=self._run_worker, daemon=True)
         self._worker_thread.start()
+        self._captions = CaptionClient(port=captions_port) if enable_captions else None
 
     def _initialize_engine(self) -> None:
         if os.name == "nt":
@@ -95,6 +119,9 @@ class _TTS:
         while True:
             text_, timeout_s, done = self._queue.get()
             try:
+                if self._captions is not None:
+                    self._captions.set_text(text_)
+
                 if self._use_sapi:
                     self._sapi_speak(text_, timeout_s)
                 else:
