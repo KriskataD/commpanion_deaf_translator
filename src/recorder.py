@@ -46,7 +46,7 @@ class MicrophoneSelector:
 class SilenceDetector:
     """Class to detect silence in audio"""
     
-    def __init__(self, silence_threshold=1000, silence_duration=2.0, sample_rate=44100):
+    def __init__(self, silence_threshold=1000, silence_duration=2.0, sample_rate=16000):
         self.silence_threshold = silence_threshold  # Amplitude threshold to detect silence
         self.silence_duration = silence_duration    # Silence duration before stopping (seconds)
         self.sample_rate = sample_rate

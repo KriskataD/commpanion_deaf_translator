@@ -135,11 +135,6 @@ class WhisperTokenSelectionMixin:
         self.logger.info("scores stats: min=%.4f max=%.4f", float(scores.min()), float(scores.max()))
         scores = self._apply_suppression_to_scores(scores)
 
-        #eot = int(getattr(self.tokenizer, "eos_token_id", -1))
-        #if getattr(self, "_block_eot_steps", 0) > 0 and 0 <= eot < scores.shape[0]:
-        #    scores[eot] = -1e9
-        #    self._block_eot_steps -= 1
-
         # If no history provided, fall back to plain greedy
         if not generated:
             return int(np.argmax(scores))
