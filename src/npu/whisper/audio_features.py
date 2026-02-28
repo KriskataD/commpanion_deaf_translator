@@ -20,6 +20,9 @@ class WhisperAudioFeaturesMixin:
             len(audio) / 16000.0, rms, peak
         )
 
+        self._last_audio_duration_s = len(audio) / 16000.0
+        self._last_audio_rms = rms
+
         return audio
 
     def _load_wav_mono_16k(self, wav_path: Path) -> np.ndarray:

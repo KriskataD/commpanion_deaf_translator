@@ -5,7 +5,16 @@ import time
 from typing import Any
 
 import numpy as np
+import gzip
 
+from dataclasses import dataclass
+
+@dataclass
+class _DecodeAttempt:
+    token_ids: list[int]
+    avg_logprob: float
+    compression_ratio: float
+    temperature: float
 
 class WhisperDecoderRuntimeMixin:
     def transcribe_wav(self, wav_path: Path, language: str | None = None) -> str:
@@ -26,10 +35,12 @@ class WhisperDecoderRuntimeMixin:
         if not prompt_ids:
             raise RuntimeError("Prompt ids empty.")
 
-        logits, kv_cache, pos, input_ids = self._decoder_prefill(prompt_ids, enc_cross_cache)
-        input_ids = self._decoder_generate(logits, kv_cache, pos, input_ids, enc_cross_cache)
+        #logits, kv_cache, pos, input_ids = self._decoder_prefill(prompt_ids, enc_cross_cache)
+        #input_ids = self._decoder_generate(logits, kv_cache, pos, input_ids, enc_cross_cache)
 
-        return self._final_decode_and_log(input_ids)
+        attempt = self._decode_with_fallback(prompt_ids, enc_cross_cache, temperatures=(0.0, 0.2, 0.4, 0.6, 0.8, 1), best_of=5)
+        return self._final_decode_and_log(attempt.token_ids)
+        #return self._final_decode_and_log(input_ids)
 
     def _run_encoder(self, features: np.ndarray) -> dict[str, np.ndarray]:
         # ----- encoder -> cross-cache outputs -----
@@ -297,3 +308,164 @@ class WhisperDecoderRuntimeMixin:
                 else:
                     cache[node.name] = np.zeros(shape, dtype=dtype)
         return cache
+    
+    def _compression_ratio(self, text: str) -> float:
+        b = text.encode("utf-8")
+        if not b:
+            return 0.0
+        return len(b) / max(1, len(gzip.compress(b)))
+
+    def _token_logprob(self, logits: np.ndarray, token_id: int) -> float:
+        scores = self._logits_to_scores(logits).astype(np.float32, copy=False)
+        scores = self._apply_suppression_to_scores(scores)  # <-- add this line
+
+        m = float(np.max(scores))
+        lse = m + float(np.log(np.sum(np.exp(scores - m))))
+        return float(scores[int(token_id)] - lse)
+
+    def _sample_token(self, logits: np.ndarray, temperature: float, rng: np.random.Generator) -> int:
+        scores = self._logits_to_scores(logits).astype(np.float32, copy=False)
+        scores = self._apply_suppression_to_scores(scores)  # keep suppression like greedy
+
+        # temperature scaling
+        scores = scores / float(temperature)
+
+        # softmax
+        m = float(np.max(scores))
+        p = np.exp(scores - m)
+        p = p / float(np.sum(p))
+
+        return int(rng.choice(p.size, p=p))   
+     
+    def _decode_once(self, prompt_ids, enc_cross_cache, temperature: float, seed: int, max_new_tokens_cap=96) -> _DecodeAttempt:
+        # prefill (same as today)
+        logits, kv_cache, pos, input_ids = self._decoder_prefill(prompt_ids, enc_cross_cache)
+        prompt_len = len(input_ids)
+
+        rng = np.random.default_rng(seed)
+
+        logprobs: list[float] = []
+        eot = int(getattr(self.tokenizer, "eos_token_id", -1))
+
+        # generate loop (mostly your code, but choose token based on temperature)
+        remaining_positions = max(0, (self.self_cache_len - pos))
+        max_new_tokens = min(max_new_tokens_cap, 200, remaining_positions)
+
+        for _ in range(max_new_tokens):
+            generated = input_ids[prompt_len:]
+
+            if temperature == 0.0:
+                # use your existing deterministic selection (includes loop-blocking)
+                next_token = int(self._select_next_token_from_logits(logits, generated=generated))
+                # compute logprob under the same logits distribution
+                lp = self._token_logprob(logits, next_token)
+            else:
+                # sampling path (no loop-blocking shaping; matches Whisper’s idea)
+                next_token = int(self._sample_token(logits, temperature, rng))
+                lp = self._token_logprob(logits, next_token)
+
+            # stop
+            if next_token == eot:
+                input_ids.append(next_token)
+                break
+
+            input_ids.append(next_token)
+            logprobs.append(lp)
+
+            # HARD ABORT (same idea as _decoder_generate)
+            generated_now = input_ids[prompt_len:]
+            if len(generated_now) >= 60:
+                uniq_ratio = len(set(generated_now[-60:])) / 60.0
+                if uniq_ratio < 0.25 or self._ngram_max_repeat(generated_now, n=4, window=120) >= 3:
+                    if self.debug:
+                        tail_txt = self.tokenizer.decode(generated_now[-30:], skip_special_tokens=False)
+                        self.logger.info("Abort decode due to repetition (uniq_ratio=%.3f). Tail=%r", uniq_ratio, tail_txt)
+                    break
+
+            logits, kv_cache = self._decoder_step(
+                token_id=next_token,
+                pos=pos,
+                kv_cache=kv_cache,
+                enc_cross_cache=enc_cross_cache,
+            )
+            pos += 1
+            if pos >= self.self_cache_len:
+                break
+
+        # compute metrics
+        text = self.tokenizer.decode(input_ids, skip_special_tokens=True).strip()
+        avg_lp = float(np.mean(logprobs)) if logprobs else 0.0
+        cr = float(self._compression_ratio(text))
+        return _DecodeAttempt(token_ids=input_ids, avg_logprob=avg_lp, compression_ratio=cr, temperature=temperature)
+    
+    def _decode_with_fallback(
+        self,
+        prompt_ids,
+        enc_cross_cache,
+        temperatures=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+        compression_ratio_threshold=2.4,
+        logprob_threshold=-1.0,
+        best_of=5,
+        seed=0,
+    ) -> _DecodeAttempt:
+        last: _DecodeAttempt | None = None
+
+        dur = float(getattr(self, "_last_audio_duration_s", 0.0))
+        rms = float(getattr(self, "_last_audio_rms", 0.0))
+
+        for t in temperatures:
+            if t == 0.0:
+                attempt = self._decode_once(
+                    prompt_ids, enc_cross_cache, temperature=0.0, seed=seed, max_new_tokens_cap=96
+                )
+            else:
+                cands = [
+                    self._decode_once(
+                        prompt_ids,
+                        enc_cross_cache,
+                        temperature=float(t),
+                        seed=seed + i + 1000,
+                        max_new_tokens_cap=96,
+                    )
+                    for i in range(best_of)
+                ]
+                attempt = max(cands, key=lambda a: (a.avg_logprob, len(a.token_ids)))
+
+            text = self.tokenizer.decode(attempt.token_ids, skip_special_tokens=True).strip()
+
+            self.logger.info(
+                "fallback attempt: temp=%.1f avg_logprob=%.3f comp_ratio=%.3f text=%r",
+                attempt.temperature,
+                attempt.avg_logprob,
+                attempt.compression_ratio,
+                text[:120],
+            )
+
+            last = attempt
+
+            # Base Whisper fallback checks
+            needs_fallback = False
+            if compression_ratio_threshold is not None and attempt.compression_ratio > compression_ratio_threshold:
+                needs_fallback = True
+            if logprob_threshold is not None and attempt.avg_logprob < logprob_threshold:
+                needs_fallback = True
+
+            # Extra trigger: output too short for the spoken duration (your new heuristic)
+            if dur >= 3.0 and rms > 0.01:
+                words = len(text.split())
+                min_words = max(4, int(dur * 1.6))  # heuristic
+                if words < min_words:
+                    needs_fallback = True
+                    if self.debug:
+                        self.logger.info(
+                            "Fallback triggered: too_short words=%d < min_words=%d (dur=%.2fs)",
+                            words, min_words, dur
+                        )
+
+            if not needs_fallback:
+                break
+
+        if last is None:
+            raise RuntimeError("decode_with_fallback called with empty temperatures")
+
+        return last
