@@ -9,12 +9,24 @@ import zlib
 
 from dataclasses import dataclass
 
+
 @dataclass
 class _DecodeAttempt:
+    # Full token ids including prompt + generated (no EOT inc:contentReference[oaicite:5]{index=5}se to append it)
     token_ids: list[int]
+
+    # Whisper-style metrics used for fallback gating
     avg_logprob: float
     compression_ratio: float
+    no_speech_prob: float
+
+    # Metadata
     temperature: float
+
+    # Internal bookkeeping (useful for ranking best_of samples)
+    sum_logprob: float
+    gen_len: int
+
 
 class WhisperDecoderRuntimeMixin:
     def transcribe_wav(self, wav_path: Path, language: str | None = None) -> str:
@@ -35,12 +47,19 @@ class WhisperDecoderRuntimeMixin:
         if not prompt_ids:
             raise RuntimeError("Prompt ids empty.")
 
-        #logits, kv_cache, pos, input_ids = self._decoder_prefill(prompt_ids, enc_cross_cache)
-        #input_ids = self._decoder_generate(logits, kv_cache, pos, input_ids, enc_cross_cache)
+        # Whisper-style fallback loop (no beam for now; temp=0 greedy, temp>0 sampling + best_of)
+        attempt = self._decode_with_fallback(
+            prompt_ids,
+            enc_cross_cache,
+            temperatures=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+            compression_ratio_threshold=2.4,
+            logprob_threshold=-1.0,
+            no_speech_threshold=0.6,
+            best_of=5,
+            seed=0,
+        )
 
-        attempt = self._decode_with_fallback(prompt_ids, enc_cross_cache, temperatures=(0.0, 0.2, 0.4, 0.6, 0.8, 1), best_of=5)
         return self._final_decode_and_log(attempt.token_ids)
-        #return self._final_decode_and_log(input_ids)
 
     def _run_encoder(self, features: np.ndarray) -> dict[str, np.ndarray]:
         # ----- encoder -> cross-cache outputs -----
@@ -50,19 +69,91 @@ class WhisperDecoderRuntimeMixin:
         self.logger.info("Encoder run returned in %.3fs", time.perf_counter() - t0)
         return {n: v for n, v in zip(self.encoder_cross_cache_names, enc_out)}
 
+    # ---------------------------
+    # Whisper heuristics helpers
+    # ---------------------------
+
+    def _compression_ratio(self, text: str) -> float:
+        # Matches Whisper's zlib-based compression_ratio() utility :contentReference[oaicite:6]{index=6}
+        b = text.encode("utf-8")
+        if not b:
+            return 0.0
+        return len(b) / max(1, len(zlib.compress(b)))
+
+    def _get_no_speech_token_id(self) -> int | None:
+        # Whisper uses "<|nospeech|>"
+        try:
+            tid = self.tokenizer.convert_tokens_to_ids("<|nospeech|>")
+        except Exception:
+            tid = None
+        if tid is None:
+            return None
+        tid = int(tid)
+        return tid if tid >= 0 else None
+
+    def _softmax_prob_from_scores(self, scores: np.ndarray, token_id: int) -> float:
+        # stable softmax prob for one token
+        s = scores.astype(np.float32, copy=False)
+        m = float(np.max(s))
+        p = np.exp(s - m)
+        denom = float(np.sum(p))
+        if denom <= 0.0:
+            return 0.0
+        return float(p[int(token_id)] / denom)
+
+    def _no_speech_prob_from_logits(self, logits: np.ndarray) -> float:
+        # IMPORTANT: no_speech_prob is measured on *raw* scores (no suppression filters),
+        # analogous to Whisper's approach in its decoding pipeline :contentReference[oaicite:7]{index=7}
+        tid = self._get_no_speech_token_id()
+        if tid is None:
+            return float("nan")
+        scores = self._logits_to_scores(logits).astype(np.float32, copy=False)
+        if not (0 <= tid < scores.shape[0]):
+            return float("nan")
+        return self._softmax_prob_from_scores(scores, tid)
+
+    def _token_logprob(self, logits: np.ndarray, token_id: int, *, at_sample_begin: bool) -> float:
+        # logprob under the same filtered distribution used for selection
+        scores = self._filtered_scores(logits, at_sample_begin=at_sample_begin)
+
+        m = float(np.max(scores))
+        lse = m + float(np.log(np.sum(np.exp(scores - m))))
+        return float(scores[int(token_id)] - lse)
+
+    def _sample_token(self, logits: np.ndarray, temperature: float, rng: np.random.Generator, *, at_sample_begin: bool) -> int:
+        scores = self._filtered_scores(logits, at_sample_begin=at_sample_begin)
+
+        # temperature scaling
+        scores = scores / float(temperature)
+
+        # softmax
+        m = float(np.max(scores))
+        p = np.exp(scores - m)
+        p = p / float(np.sum(p))
+
+        return int(rng.choice(p.size, p=p))
+
+    # ---------------------------
+    # Decoder (prefill/generate)
+    # ---------------------------
+
     def _decoder_prefill(
         self,
         prompt_ids: list[int],
         enc_cross_cache: dict[str, np.ndarray],
-    ) -> tuple[np.ndarray | None, dict[str, np.ndarray], int, list[int]]:
-        # KV cache init
+    ) -> tuple[np.ndarray | None, dict[str, np.ndarray], int, list[int], float]:
+        """
+        Prefill each prompt token sequentially (because input_ids is [1,1]).
+        Captures no_speech_prob from the logits after the first token (SOT).
+        """
         kv_cache = self._initialize_kv_cache() if self.has_kv_cache else {}
 
-        # Prefill each prompt token sequentially (because input_ids is [1,1])
-        # This warms the self-cache and produces logits for the next token.
         logits = None
         pos = 0
         prev_cache_out: dict[str, np.ndarray] | None = None
+
+        no_speech_prob = float("nan")
+
         for t, tok in enumerate(prompt_ids):
             if self.debug_kv and prev_cache_out is not None:
                 wiring_ok = self._cache_dicts_equal(kv_cache, prev_cache_out)
@@ -75,6 +166,11 @@ class WhisperDecoderRuntimeMixin:
                 kv_cache=kv_cache,
                 enc_cross_cache=enc_cross_cache,
             )
+
+            # Capture no_speech_prob from the SOT-step logits (t==0) using raw logits.
+            # This aligns with the intent of Whisper's no_speech gating heuristic. :contentReference[oaicite:8]{index=8}
+            if t == 0 and logits is not None:
+                no_speech_prob = self._no_speech_prob_from_logits(logits)
 
             if self.debug_kv:
                 layers_match, common_top_idx, global_max = self._cache_delta_summary(cache_in, kv_cache, pos)
@@ -96,9 +192,8 @@ class WhisperDecoderRuntimeMixin:
             if pos >= self.self_cache_len:
                 break
 
-        # Now generate new tokens
         input_ids: list[int] = prompt_ids.copy()
-        return logits, kv_cache, pos, input_ids
+        return logits, kv_cache, pos, input_ids, float(no_speech_prob)
 
     def _decoder_generate(
         self,
@@ -108,14 +203,16 @@ class WhisperDecoderRuntimeMixin:
         input_ids: list[int],
         enc_cross_cache: dict[str, np.ndarray],
     ) -> list[int]:
+        """
+        (Optional legacy path) Deterministic greedy generation.
+        NOTE: This is *not* used by the Whisper-style fallback path below.
+        """
         eot_token = int(getattr(self.tokenizer, "eos_token_id", -1))
         if eot_token < 0:
             raise RuntimeError("Tokenizer eos_token_id missing.")
 
-        # pos currently == len(prompt_ids)  (next position index to be generated)
         remaining_positions = max(0, (self.self_cache_len - pos))
         max_new_tokens = min(200, remaining_positions)
-
         prompt_len = len(input_ids)
 
         self.logger.info(
@@ -123,17 +220,8 @@ class WhisperDecoderRuntimeMixin:
             pos, self.self_cache_len, self.attn_max_len, max_new_tokens
         )
 
-        if self.debug:
-            eot = int(getattr(self.tokenizer, "eos_token_id", -1))
-            self.logger.info("eot_token_id=%d suppressed=%s", eot, (eot in self.suppress_tokens))
-
-        # We already have logits from the last prefill step (unless prompt was empty)
-        for step in range(max_new_tokens):
-            if self.debug_kv and step % 10 == 0:
-                self.logger.info("Decoder gen step %d/%d", step + 1, max_new_tokens)
-
+        for _ in range(max_new_tokens):
             if logits is None:
-                # Safety: compute logits for "next token" from last known token at previous position
                 last_tok = input_ids[-1]
                 logits, kv_cache = self._decoder_step(
                     token_id=int(last_tok),
@@ -142,61 +230,20 @@ class WhisperDecoderRuntimeMixin:
                     enc_cross_cache=enc_cross_cache,
                 )
 
-            generated = input_ids[prompt_len:]  # only tokens generated AFTER prompt
-            next_token = int(self._select_next_token_from_logits(logits, generated=generated))
+            at_sample_begin = (len(input_ids) == prompt_len)
+            next_token = int(self._select_next_token_from_logits(logits, generated=None, at_sample_begin=at_sample_begin))
 
-            if self.debug_kv and step == 0:
-                top5_ids, top5_scores = self._topk_from_logits(logits, k=5)
-                top5_toks = [self.tokenizer.decode([int(tid)], skip_special_tokens=False) for tid in top5_ids]
-                chosen_tok = self.tokenizer.decode([next_token], skip_special_tokens=False)
-                self.logger.info(
-                    "GEN-START from last-prompt logits: top5_ids=%s top5_toks=%s chosen_id=%d chosen_tok=%r",
-                    top5_ids,
-                    top5_toks,
-                    next_token,
-                    chosen_tok,
-                )
-                self.logger.info(
-                    "GEN-STEP0 inputs: pos=%d input_id=%d/%r (from last prompt logits)",
-                    pos,
-                    next_token,
-                    chosen_tok,
-                )
-
-            # If model ends immediately, stop.
             if next_token == eot_token:
-                input_ids.append(next_token)
                 break
 
-            # IMPORTANT: next_token belongs to CURRENT pos
             input_ids.append(next_token)
-
-            # HARD ABORT: if we're clearly stuck in repetition, stop early rather than output garbage.
-            generated_now = input_ids[prompt_len:]
-            if len(generated_now) >= 60:
-                uniq_ratio = len(set(generated_now[-60:])) / 60.0
-                if uniq_ratio < 0.25 or self._ngram_max_repeat(generated_now, n=4, window=120) >= 3:
-                    if self.debug:
-                        tail_txt = self.tokenizer.decode(generated_now[-30:], skip_special_tokens=False)
-                        self.logger.info("Abort decode due to repetition (uniq_ratio=%.3f). Tail=%r", uniq_ratio, tail_txt)
-                    break
 
             logits, kv_cache = self._decoder_step(
                 token_id=next_token,
-                pos=pos,  # <-- correct position for this token
+                pos=pos,
                 kv_cache=kv_cache,
                 enc_cross_cache=enc_cross_cache,
             )
-
-            if self.debug_kv and step == 0:
-                top5_ids, top5_scores = self._topk_from_logits(logits, k=5)
-                top5_toks = [self.tokenizer.decode([int(tid)], skip_special_tokens=False) for tid in top5_ids]
-                self.logger.info(
-                    "GEN-STEP1 logits: top5_ids=%s top5_toks=%s top5_scores=%s",
-                    top5_ids,
-                    top5_toks,
-                    [float(s) for s in top5_scores],
-                )
 
             pos += 1
             if pos >= self.self_cache_len:
@@ -235,28 +282,21 @@ class WhisperDecoderRuntimeMixin:
             if self.debug:
                 self.logger.info("attn_mask float16 min=%.1f max=%.1f", float(attn.min()), float(attn.max()))
         else:
-            # attention_mask: [1,1,1,200] uint16 (plain values, not packed-fp16)
             attn = np.zeros((1, 1, 1, self.attn_max_len), dtype=np.uint16)
             attn[0, 0, 0, -count:] = np.uint16(65535)
             decoder_inputs[self.decoder_attention_mask_name] = attn
             self.logger.info("attn_mask uint16 min=%d max=%d", int(attn.min()), int(attn.max()))
 
-        # position_ids: [1] int32 (NOT [1,1])
         pid_dtype = self._dtype_for_input(self.decoder_position_ids_name, fallback=np.int32)
         if self.profile.name == "large-v3-turbo":
-            # IMPORTANT: turbo expects FORWARD positions
-            pid = count - 1   # == pos unless clipped
+            pid = count - 1   # forward positions
         else:
-            # small-quantized expects REVERSE positions
-            pid = self.self_cache_len - count
+            pid = self.self_cache_len - count  # reverse positions
         decoder_inputs[self.decoder_position_ids_name] = np.array([pid], dtype=pid_dtype)
 
-
-        # KV cache in (self)
         if self.has_kv_cache:
             decoder_inputs.update(kv_cache)
 
-        # Cross cache in
         if self.decoder_uses_cross_cache:
             decoder_inputs.update(enc_cross_cache)
 
@@ -272,7 +312,6 @@ class WhisperDecoderRuntimeMixin:
         output_map = {node.name: value for node, value in zip(self.decoder_io.outputs, outputs)}
         logits = output_map[self.decoder_logits_name]
 
-        # Update KV cache from *_out
         if self.has_kv_cache:
             new_cache = {name.replace("_out", "_in"): output_map[name] for name in self.kv_self_out_names}
         else:
@@ -283,12 +322,10 @@ class WhisperDecoderRuntimeMixin:
     def _build_prompt_ids(self, language: str | None) -> list[int]:
         lang = (language or "en").lower()
 
-        # Pull SOT directly from WhisperTokenizer rather than relying on a numeric id.
         start = self.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
         if start is None or int(start) < 0:
             raise RuntimeError("Cannot resolve WhisperTokenizer SOT token id.")
 
-        # Get language/task prompt ids from tokenizer (e.g. <|en|><|transcribe|><|notimestamps|>)
         rest: list[int] = []
         if hasattr(self.tokenizer, "get_decoder_prompt_ids"):
             items = self.tokenizer.get_decoder_prompt_ids(language=lang, task="transcribe")
@@ -300,91 +337,64 @@ class WhisperDecoderRuntimeMixin:
         cache: dict[str, np.ndarray] = {}
         for node in self.decoder_io.inputs:
             if node.name in self.kv_self_in_names:
-                shape = tuple(int(d) for d in node.shape)  # fully static
-                #cache[node.name] = np.zeros(shape, dtype=self._numpy_dtype_from_ort(node.type))
+                shape = tuple(int(d) for d in node.shape)
                 dtype = self._numpy_dtype_from_ort(node.type)
                 if dtype == np.uint8:
-                    cache[node.name] = np.full(shape, 128, dtype=np.uint8)  # ✅ common zero-point
+                    cache[node.name] = np.full(shape, 128, dtype=np.uint8)  # common zero-point
                 else:
                     cache[node.name] = np.zeros(shape, dtype=dtype)
         return cache
-    
-    def _compression_ratio(self, text: str) -> float:
-        b = text.encode("utf-8")
-        if not b:
-            return 0.0
-        return len(b) / max(1, len(zlib.compress(b)))
 
-    def _token_logprob(self, logits: np.ndarray, token_id: int) -> float:
-        scores = self._logits_to_scores(logits).astype(np.float32, copy=False)
-        scores = self._apply_suppression_to_scores(scores)  # <-- add this line
+    # ---------------------------
+    # Whisper-style single decode
+    # ---------------------------
 
-        m = float(np.max(scores))
-        lse = m + float(np.log(np.sum(np.exp(scores - m))))
-        return float(scores[int(token_id)] - lse)
-
-    def _sample_token(self, logits: np.ndarray, temperature: float, rng: np.random.Generator) -> int:
-        scores = self._logits_to_scores(logits).astype(np.float32, copy=False)
-        scores = self._apply_suppression_to_scores(scores)  # keep suppression like greedy
-
-        # temperature scaling
-        scores = scores / float(temperature)
-
-        # softmax
-        m = float(np.max(scores))
-        p = np.exp(scores - m)
-        p = p / float(np.sum(p))
-
-        return int(rng.choice(p.size, p=p))   
-     
-    def _decode_once(self, prompt_ids, enc_cross_cache, temperature: float, seed: int, max_new_tokens_cap=96) -> _DecodeAttempt:
-        # prefill (same as today)
-        logits, kv_cache, pos, input_ids = self._decoder_prefill(prompt_ids, enc_cross_cache)
+    def _decode_once(
+        self,
+        prompt_ids,
+        enc_cross_cache,
+        temperature: float,
+        seed: int,
+        max_new_tokens_cap: int = 96,
+    ) -> _DecodeAttempt:
+        logits, kv_cache, pos, input_ids, no_speech_prob = self._decoder_prefill(prompt_ids, enc_cross_cache)
         prompt_len = len(input_ids)
 
         rng = np.random.default_rng(seed)
-
-        logprobs: list[float] = []
         eot = int(getattr(self.tokenizer, "eos_token_id", -1))
 
-        # generate loop (mostly your code, but choose token based on temperature)
+        sum_lp = 0.0
+        gen_tokens: list[int] = []
+
         remaining_positions = max(0, (self.self_cache_len - pos))
         max_new_tokens = min(max_new_tokens_cap, 200, remaining_positions)
 
         for _ in range(max_new_tokens):
-            generated = input_ids[prompt_len:]
+            at_sample_begin = (len(input_ids) == prompt_len)
+
+            if logits is None:
+                # safety fallback: compute logits from last token
+                last_tok = input_ids[-1]
+                logits, kv_cache = self._decoder_step(
+                    token_id=int(last_tok),
+                    pos=max(0, pos - 1),
+                    kv_cache=kv_cache,
+                    enc_cross_cache=enc_cross_cache,
+                )
 
             if temperature == 0.0:
-                # deterministic Whisper-style greedy selection
-                next_token = int(self._select_next_token_from_logits(logits, generated=generated))
-                # compute logprob under the same logits distribution
-                lp = self._token_logprob(logits, next_token)
+                next_token = int(self._select_next_token_from_logits(logits, generated=None, at_sample_begin=at_sample_begin))
             else:
-                # sampling path (no loop-blocking shaping; matches Whisper’s idea)
-                next_token = int(self._sample_token(logits, temperature, rng))
-                lp = self._token_logprob(logits, next_token)
+                next_token = int(self._sample_token(logits, temperature, rng, at_sample_begin=at_sample_begin))
 
-            # stop
+            lp = self._token_logprob(logits, next_token, at_sample_begin=at_sample_begin)
+
             if next_token == eot:
-                input_ids.append(next_token)
                 break
 
             input_ids.append(next_token)
-            logprobs.append(lp)
-
-            # HARD ABORT (same idea as _decoder_generate)
-            generated_now = input_ids[prompt_len:]
-
-            if temperature > 0.0 and len(generated_now) >= 60:
-                uniq_ratio = len(set(generated_now[-60:])) / 60.0
-                if uniq_ratio < 0.25 or self._ngram_max_repeat(generated_now, n=3, window=120) >= 3:
-                    if self.debug:
-                        tail_txt = self.tokenizer.decode(generated_now[-30:], skip_special_tokens=False)
-                        self.logger.info(
-                            "Abort decode due to repetition (uniq_ratio=%.3f). Tail=%r",
-                            uniq_ratio, tail_txt
-                        )
-                    break
+            gen_tokens.append(next_token)
+            sum_lp += float(lp)
 
             logits, kv_cache = self._decoder_step(
                 token_id=next_token,
@@ -396,12 +406,28 @@ class WhisperDecoderRuntimeMixin:
             if pos >= self.self_cache_len:
                 break
 
-        # compute metrics
-        text = self.tokenizer.decode(input_ids, skip_special_tokens=True).strip()
-        avg_lp = float(np.mean(logprobs)) if logprobs else 0.0
+        text = self.tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
         cr = float(self._compression_ratio(text))
-        return _DecodeAttempt(token_ids=input_ids, avg_logprob=avg_lp, compression_ratio=cr, temperature=temperature)
-    
+
+        gen_len = len(gen_tokens)
+
+        # avg_logprob as used by the original implementation (sum_logprobs / len(tokens)) :contentReference[oaicite:9]{index=9}
+        avg_lp = float(sum_lp / max(1, gen_len))
+
+        return _DecodeAttempt(
+            token_ids=prompt_ids + gen_tokens,
+            avg_logprob=avg_lp,
+            compression_ratio=cr,
+            no_speech_prob=float(no_speech_prob),
+            temperature=float(temperature),
+            sum_logprob=float(sum_lp),
+            gen_len=int(gen_len),
+        )
+
+    # ---------------------------
+    # Whisper-style fallback loop
+    # ---------------------------
+
     def _decode_with_fallback(
         self,
         prompt_ids,
@@ -409,53 +435,30 @@ class WhisperDecoderRuntimeMixin:
         temperatures=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
         compression_ratio_threshold=2.4,
         logprob_threshold=-1.0,
+        no_speech_threshold=0.6,
         best_of=5,
         seed=0,
-        # tuneables
-        min_words_per_sec: float = 1.6,
-        repeat_ngram_n: int = 4,
-        repeat_ngram_limit: int = 2,
+        max_new_tokens_cap: int = 96,
     ) -> _DecodeAttempt:
-        prompt_len = len(prompt_ids)
-        dur = float(getattr(self, "_last_audio_duration_s", 0.0))
-        rms = float(getattr(self, "_last_audio_rms", 0.0))
-
-        best_ok: _DecodeAttempt | None = None
-        best_any: _DecodeAttempt | None = None
-        best_any_score: float = -1e30
-
-        def overall_score(attempt: _DecodeAttempt, text: str) -> float:
-            # Prefer higher total logprob estimate over avg_logprob alone
-            gen_len = max(1, len(attempt.token_ids) - prompt_len)
-            sum_lp_est = float(attempt.avg_logprob) * float(gen_len)
-
-            # Penalize being too short for non-trivial speech
-            if dur >= 3.0 and rms > 0.01:
-                words = len(text.split())
-                min_words = max(4, int(dur * min_words_per_sec))
-                missing = max(0, min_words - words)
-                sum_lp_est -= 2.0 * float(missing)  # strong penalty per missing word
-
-            # Penalize repetition (if any)
-            gen = attempt.token_ids[prompt_len:]
-            if len(gen) >= 12:
-                rep = int(self._ngram_max_repeat(gen, n=repeat_ngram_n, window=200))
-                if rep >= repeat_ngram_limit:
-                    sum_lp_est -= 10.0 * float(rep - (repeat_ngram_limit - 1))
-
-            # Penalize crazy compression ratio
-            if compression_ratio_threshold is not None and attempt.compression_ratio > compression_ratio_threshold:
-                sum_lp_est -= 20.0 * float(attempt.compression_ratio - compression_ratio_threshold)
-
-            return sum_lp_est
+        """
+        Mirrors Whisper's decode_with_fallback logic:
+          - try temps in order
+          - fail if too repetitive (compression ratio) or too low-confidence (avg_logprob)
+          - BUT if no_speech_prob is high AND avg_logprob is low, treat as silence (no fallback)
+        :contentReference[oaicite:10]{index=10}
+        """
+        decode_result: _DecodeAttempt | None = None
 
         for t in temperatures:
             t = float(t)
 
-            # --- run decodes at this temperature ---
             if t == 0.0:
-                attempt = self._decode_once(
-                    prompt_ids, enc_cross_cache, temperature=0.0, seed=seed, max_new_tokens_cap=96
+                decode_result = self._decode_once(
+                    prompt_ids,
+                    enc_cross_cache,
+                    temperature=0.0,
+                    seed=seed,
+                    max_new_tokens_cap=max_new_tokens_cap,
                 )
             else:
                 cands = [
@@ -464,79 +467,47 @@ class WhisperDecoderRuntimeMixin:
                         enc_cross_cache,
                         temperature=t,
                         seed=seed + 1000 + i,
-                        max_new_tokens_cap=96,
+                        max_new_tokens_cap=max_new_tokens_cap,
                     )
-                    for i in range(best_of)
+                    for i in range(int(best_of))
                 ]
 
-                # Pick best candidate at this temperature using length-aware score
-                scored = []
-                for a in cands:
-                    txt = self.tokenizer.decode(a.token_ids, skip_special_tokens=True).strip()
-                    scored.append((overall_score(a, txt), a, txt))
-                scored.sort(key=lambda x: x[0], reverse=True)
-                attempt = scored[0][1]
+                # pick best candidate at this temperature (max avg_logprob)
+                decode_result = max(cands, key=lambda a: (a.sum_logprob / max(1, a.gen_len)))
 
-            text = self.tokenizer.decode(attempt.token_ids, skip_special_tokens=True).strip()
-            gen = attempt.token_ids[prompt_len:]
-
-            # --- gates (needs_fallback + reasons) ---
+            # --- gating ---
             needs_fallback = False
-            reasons: list[str] = []
 
-            if compression_ratio_threshold is not None and attempt.compression_ratio > compression_ratio_threshold:
+            if compression_ratio_threshold is not None and decode_result.compression_ratio > float(compression_ratio_threshold):
                 needs_fallback = True
-                reasons.append(f"compression_ratio>{compression_ratio_threshold:g}")
 
-            if logprob_threshold is not None and attempt.avg_logprob < logprob_threshold:
+            if logprob_threshold is not None and decode_result.avg_logprob < float(logprob_threshold):
                 needs_fallback = True
-                reasons.append(f"avg_logprob<{logprob_threshold:g}")
 
-            if dur >= 3.0 and rms > 0.01:
-                words = len(text.split())
-                min_words = max(4, int(dur * min_words_per_sec))
-                if words < min_words:
-                    needs_fallback = True
-                    reasons.append(f"too_short words={words}<{min_words}")
+            # Silence override (exact condition described in transcribe.py) :contentReference[oaicite:11]{index=11}
+            if (
+                no_speech_threshold is not None
+                and decode_result.no_speech_prob > float(no_speech_threshold)
+                and logprob_threshold is not None
+                and decode_result.avg_logprob < float(logprob_threshold)
+            ):
+                needs_fallback = False
 
-            rep = 0
-            if len(gen) >= 12:
-                rep = int(self._ngram_max_repeat(gen, n=repeat_ngram_n, window=200))
-                if rep >= repeat_ngram_limit:
-                    needs_fallback = True
-                    reasons.append(f"repeat_ngram n={repeat_ngram_n} rep={rep}")
-
-            # --- track best_any across all temps ---
-            s = overall_score(attempt, text)
-            if s > best_any_score:
-                best_any_score = s
-                best_any = attempt
-
+            txt = self.tokenizer.decode(decode_result.token_ids, skip_special_tokens=True).strip()
             self.logger.info(
-                "fallback attempt: temp=%.1f avg_logprob=%.3f comp_ratio=%.3f rep=%d needs_fallback=%s reasons=%s text=%r",
+                "fallback attempt: temp=%.1f avg_logprob=%.3f comp_ratio=%.3f no_speech_prob=%.3f needs_fallback=%s text=%r",
                 t,
-                float(attempt.avg_logprob),
-                float(attempt.compression_ratio),
-                int(rep),
+                float(decode_result.avg_logprob),
+                float(decode_result.compression_ratio),
+                float(decode_result.no_speech_prob),
                 bool(needs_fallback),
-                ",".join(reasons) if reasons else "-",
-                text[:120],
+                txt[:120],
             )
 
             if not needs_fallback:
-                best_ok = attempt
                 break
 
-        chosen = best_ok if best_ok is not None else best_any
-        if chosen is None:
+        if decode_result is None:
             raise RuntimeError("decode_with_fallback: no attempts produced")
 
-        chosen_text = self.tokenizer.decode(chosen.token_ids, skip_special_tokens=True).strip()
-        self.logger.info(
-            "fallback chosen: temp=%.1f avg_logprob=%.3f comp_ratio=%.3f text=%r",
-            float(chosen.temperature),
-            float(chosen.avg_logprob),
-            float(chosen.compression_ratio),
-            chosen_text[:120],
-        )
-        return chosen
+        return decode_result

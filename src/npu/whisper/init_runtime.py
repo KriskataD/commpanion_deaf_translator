@@ -141,17 +141,32 @@ class WhisperInitRuntimeMixin:
                 self.logger.info("OUT %-35s shape=%s type=%s", node.name, node.shape, node.type)
 
     def _init_feature_extractor_and_tokenizer(self) -> None:
-        if self.profile.name == "large-v3-turbo":
-            self.feature_extractor = WhisperFeatureExtractor(
-                feature_size=self.profile.n_mels,
-                sampling_rate=16000,
-            )
-        else:
-            self.feature_extractor = WhisperFeatureExtractor.from_pretrained(self.profile.hf_id)
+        # Use the model's actual preprocessor_config.json for BOTH profiles.
+        # (large-v3-turbo has feature_size=128 etc in its HF config)
+        self.feature_extractor = WhisperFeatureExtractor.from_pretrained(self.profile.hf_id)
 
         self.tokenizer = WhisperTokenizer.from_pretrained(self.profile.hf_id)
         self.config = WhisperConfig.from_pretrained(self.profile.hf_id)
-        self.suppress_tokens = set(self.config.suppress_tokens or [])
+
+        # Your updated token_selection / decoder_runtime should rely on these
+        self.suppress_blank = True
+
+        # ---- suppress_tokens: match Whisper's behavior more closely ----
+        st = [int(x) for x in (self.config.suppress_tokens or [])]
+
+        # OpenAI Whisper uses "-1" as a special meaning for suppression defaults (commonly non-speech tokens).
+        # HF sometimes expands this already, but keep compatibility.
+        # (Note: OpenAI repo discussions mention the default "-1" behavior explicitly.)
+        if -1 in st:
+            st = [t for t in st if t >= 0]
+            if hasattr(self.tokenizer, "non_speech_tokens"):
+                st.extend(int(t) for t in self.tokenizer.non_speech_tokens)
+
+        self.suppress_tokens = set(st)
+
+        # ---- begin_suppress_tokens: suppress-at-start list (Whisper-style) ----
+        bst = getattr(self.config, "begin_suppress_tokens", None) or []
+        self.begin_suppress_tokens = set(int(x) for x in bst)
 
     def _discover_io_names_and_cache_metadata(self) -> None:
         # Names from IO

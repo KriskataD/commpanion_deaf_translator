@@ -43,7 +43,7 @@ TURBO_PROFILE = SttProfile(
     attention_mask_dtype=np.float16,
     mask_style="additive-f16",
     logits_dtype=np.float16,
-    pid_style="reverse",
+    pid_style="forward",
 )
 
 
