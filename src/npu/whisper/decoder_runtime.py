@@ -209,7 +209,7 @@ class WhisperDecoderRuntimeMixin:
 
         if self.profile.name == "large-v3-turbo":
             attn = np.full((1, 1, 1, self.attn_max_len), np.float16(-65504.0), dtype=np.float16)
-            attn[0, 0, 0, :count] = np.float16(0.0)
+            attn[0, 0, 0, -count:] = np.float16(0.0)
             decoder_inputs[self.decoder_attention_mask_name] = attn
             if self.debug:
                 self.logger.info("attn_mask float16 min=%.1f max=%.1f", float(attn.min()), float(attn.max()))
