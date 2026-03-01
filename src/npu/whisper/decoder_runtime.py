@@ -355,7 +355,7 @@ class WhisperDecoderRuntimeMixin:
             generated = input_ids[prompt_len:]
 
             if temperature == 0.0:
-                # use your existing deterministic selection (includes loop-blocking)
+                # deterministic Whisper-style greedy selection
                 next_token = int(self._select_next_token_from_logits(logits, generated=generated))
                 # compute logprob under the same logits distribution
                 lp = self._token_logprob(logits, next_token)
@@ -410,9 +410,6 @@ class WhisperDecoderRuntimeMixin:
     ) -> _DecodeAttempt:
         last: _DecodeAttempt | None = None
 
-        dur = float(getattr(self, "_last_audio_duration_s", 0.0))
-        rms = float(getattr(self, "_last_audio_rms", 0.0))
-
         for t in temperatures:
             if t == 0.0:
                 attempt = self._decode_once(
@@ -429,7 +426,7 @@ class WhisperDecoderRuntimeMixin:
                     )
                     for i in range(best_of)
                 ]
-                attempt = max(cands, key=lambda a: (a.avg_logprob, len(a.token_ids)))
+                attempt = max(cands, key=lambda a: a.avg_logprob)
 
             text = self.tokenizer.decode(attempt.token_ids, skip_special_tokens=True).strip()
 
@@ -450,22 +447,19 @@ class WhisperDecoderRuntimeMixin:
             if logprob_threshold is not None and attempt.avg_logprob < logprob_threshold:
                 needs_fallback = True
 
-            # Extra trigger: output too short for the spoken duration (your new heuristic)
-            if dur >= 3.0 and rms > 0.01:
-                words = len(text.split())
-                min_words = max(4, int(dur * 1.6))  # heuristic
-                if words < min_words:
-                    needs_fallback = True
-                    if self.debug:
-                        self.logger.info(
-                            "Fallback triggered: too_short words=%d < min_words=%d (dur=%.2fs)",
-                            words, min_words, dur
-                        )
-
             if not needs_fallback:
                 break
 
         if last is None:
             raise RuntimeError("decode_with_fallback called with empty temperatures")
+
+        chosen_text = self.tokenizer.decode(last.token_ids, skip_special_tokens=True).strip()
+        self.logger.info(
+            "fallback chosen: temp=%.1f avg_logprob=%.3f comp_ratio=%.3f text=%r",
+            last.temperature,
+            last.avg_logprob,
+            last.compression_ratio,
+            chosen_text[:120],
+        )
 
         return last
