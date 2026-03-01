@@ -123,7 +123,7 @@ class AudioRecorder:
         self.chunk_size = 1024
         self.sample_format = pyaudio.paInt16
         self.channels = 1
-        self.sample_rate = 44100
+        self.sample_rate = 16000
         self.microphone_index = None
         
         self.is_recording = False

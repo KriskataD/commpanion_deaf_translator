@@ -5,7 +5,7 @@ import time
 from typing import Any
 
 import numpy as np
-import gzip
+import zlib
 
 from dataclasses import dataclass
 
@@ -313,7 +313,7 @@ class WhisperDecoderRuntimeMixin:
         b = text.encode("utf-8")
         if not b:
             return 0.0
-        return len(b) / max(1, len(gzip.compress(b)))
+        return len(b) / max(1, len(zlib.compress(b)))
 
     def _token_logprob(self, logits: np.ndarray, token_id: int) -> float:
         scores = self._logits_to_scores(logits).astype(np.float32, copy=False)
@@ -374,12 +374,16 @@ class WhisperDecoderRuntimeMixin:
 
             # HARD ABORT (same idea as _decoder_generate)
             generated_now = input_ids[prompt_len:]
-            if len(generated_now) >= 60:
+
+            if temperature > 0.0 and len(generated_now) >= 60:
                 uniq_ratio = len(set(generated_now[-60:])) / 60.0
-                if uniq_ratio < 0.25 or self._ngram_max_repeat(generated_now, n=4, window=120) >= 3:
+                if uniq_ratio < 0.25 or self._ngram_max_repeat(generated_now, n=3, window=120) >= 3:
                     if self.debug:
                         tail_txt = self.tokenizer.decode(generated_now[-30:], skip_special_tokens=False)
-                        self.logger.info("Abort decode due to repetition (uniq_ratio=%.3f). Tail=%r", uniq_ratio, tail_txt)
+                        self.logger.info(
+                            "Abort decode due to repetition (uniq_ratio=%.3f). Tail=%r",
+                            uniq_ratio, tail_txt
+                        )
                     break
 
             logits, kv_cache = self._decoder_step(
@@ -407,10 +411,48 @@ class WhisperDecoderRuntimeMixin:
         logprob_threshold=-1.0,
         best_of=5,
         seed=0,
+        # tuneables
+        min_words_per_sec: float = 1.6,
+        repeat_ngram_n: int = 4,
+        repeat_ngram_limit: int = 2,
     ) -> _DecodeAttempt:
-        last: _DecodeAttempt | None = None
+        prompt_len = len(prompt_ids)
+        dur = float(getattr(self, "_last_audio_duration_s", 0.0))
+        rms = float(getattr(self, "_last_audio_rms", 0.0))
+
+        best_ok: _DecodeAttempt | None = None
+        best_any: _DecodeAttempt | None = None
+        best_any_score: float = -1e30
+
+        def overall_score(attempt: _DecodeAttempt, text: str) -> float:
+            # Prefer higher total logprob estimate over avg_logprob alone
+            gen_len = max(1, len(attempt.token_ids) - prompt_len)
+            sum_lp_est = float(attempt.avg_logprob) * float(gen_len)
+
+            # Penalize being too short for non-trivial speech
+            if dur >= 3.0 and rms > 0.01:
+                words = len(text.split())
+                min_words = max(4, int(dur * min_words_per_sec))
+                missing = max(0, min_words - words)
+                sum_lp_est -= 2.0 * float(missing)  # strong penalty per missing word
+
+            # Penalize repetition (if any)
+            gen = attempt.token_ids[prompt_len:]
+            if len(gen) >= 12:
+                rep = int(self._ngram_max_repeat(gen, n=repeat_ngram_n, window=200))
+                if rep >= repeat_ngram_limit:
+                    sum_lp_est -= 10.0 * float(rep - (repeat_ngram_limit - 1))
+
+            # Penalize crazy compression ratio
+            if compression_ratio_threshold is not None and attempt.compression_ratio > compression_ratio_threshold:
+                sum_lp_est -= 20.0 * float(attempt.compression_ratio - compression_ratio_threshold)
+
+            return sum_lp_est
 
         for t in temperatures:
+            t = float(t)
+
+            # --- run decodes at this temperature ---
             if t == 0.0:
                 attempt = self._decode_once(
                     prompt_ids, enc_cross_cache, temperature=0.0, seed=seed, max_new_tokens_cap=96
@@ -420,46 +462,81 @@ class WhisperDecoderRuntimeMixin:
                     self._decode_once(
                         prompt_ids,
                         enc_cross_cache,
-                        temperature=float(t),
-                        seed=seed + i + 1000,
+                        temperature=t,
+                        seed=seed + 1000 + i,
                         max_new_tokens_cap=96,
                     )
                     for i in range(best_of)
                 ]
-                attempt = max(cands, key=lambda a: a.avg_logprob)
+
+                # Pick best candidate at this temperature using length-aware score
+                scored = []
+                for a in cands:
+                    txt = self.tokenizer.decode(a.token_ids, skip_special_tokens=True).strip()
+                    scored.append((overall_score(a, txt), a, txt))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                attempt = scored[0][1]
 
             text = self.tokenizer.decode(attempt.token_ids, skip_special_tokens=True).strip()
+            gen = attempt.token_ids[prompt_len:]
+
+            # --- gates (needs_fallback + reasons) ---
+            needs_fallback = False
+            reasons: list[str] = []
+
+            if compression_ratio_threshold is not None and attempt.compression_ratio > compression_ratio_threshold:
+                needs_fallback = True
+                reasons.append(f"compression_ratio>{compression_ratio_threshold:g}")
+
+            if logprob_threshold is not None and attempt.avg_logprob < logprob_threshold:
+                needs_fallback = True
+                reasons.append(f"avg_logprob<{logprob_threshold:g}")
+
+            if dur >= 3.0 and rms > 0.01:
+                words = len(text.split())
+                min_words = max(4, int(dur * min_words_per_sec))
+                if words < min_words:
+                    needs_fallback = True
+                    reasons.append(f"too_short words={words}<{min_words}")
+
+            rep = 0
+            if len(gen) >= 12:
+                rep = int(self._ngram_max_repeat(gen, n=repeat_ngram_n, window=200))
+                if rep >= repeat_ngram_limit:
+                    needs_fallback = True
+                    reasons.append(f"repeat_ngram n={repeat_ngram_n} rep={rep}")
+
+            # --- track best_any across all temps ---
+            s = overall_score(attempt, text)
+            if s > best_any_score:
+                best_any_score = s
+                best_any = attempt
 
             self.logger.info(
-                "fallback attempt: temp=%.1f avg_logprob=%.3f comp_ratio=%.3f text=%r",
-                attempt.temperature,
-                attempt.avg_logprob,
-                attempt.compression_ratio,
+                "fallback attempt: temp=%.1f avg_logprob=%.3f comp_ratio=%.3f rep=%d needs_fallback=%s reasons=%s text=%r",
+                t,
+                float(attempt.avg_logprob),
+                float(attempt.compression_ratio),
+                int(rep),
+                bool(needs_fallback),
+                ",".join(reasons) if reasons else "-",
                 text[:120],
             )
 
-            last = attempt
-
-            # Base Whisper fallback checks
-            needs_fallback = False
-            if compression_ratio_threshold is not None and attempt.compression_ratio > compression_ratio_threshold:
-                needs_fallback = True
-            if logprob_threshold is not None and attempt.avg_logprob < logprob_threshold:
-                needs_fallback = True
-
             if not needs_fallback:
+                best_ok = attempt
                 break
 
-        if last is None:
-            raise RuntimeError("decode_with_fallback called with empty temperatures")
+        chosen = best_ok if best_ok is not None else best_any
+        if chosen is None:
+            raise RuntimeError("decode_with_fallback: no attempts produced")
 
-        chosen_text = self.tokenizer.decode(last.token_ids, skip_special_tokens=True).strip()
+        chosen_text = self.tokenizer.decode(chosen.token_ids, skip_special_tokens=True).strip()
         self.logger.info(
             "fallback chosen: temp=%.1f avg_logprob=%.3f comp_ratio=%.3f text=%r",
-            last.temperature,
-            last.avg_logprob,
-            last.compression_ratio,
+            float(chosen.temperature),
+            float(chosen.avg_logprob),
+            float(chosen.compression_ratio),
             chosen_text[:120],
         )
-
-        return last
+        return chosen
