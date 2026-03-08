@@ -14,6 +14,7 @@ from typing import Callable
 
 from .translator import TranslatorPipeline
 from .wakeword_detector import WakeWordDetector
+from .ocr.scan_once import OcrScanner
 
 
 class WakeWordTranslationAssistant:
@@ -42,6 +43,12 @@ class WakeWordTranslationAssistant:
 
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
+
+        self.ocr_scanner = OcrScanner(
+            detector_onnx="src/models/easyocr_detector_float_optimized_onnx/model.onnx",
+            recognizer_onnx="src/models/easyocr_recognizer_float_optimized_onnx/model.onnx",
+            camera_id=0,
+        )
 
         self.translation = TranslatorPipeline(
             audio_dir=audio_dir,
@@ -169,6 +176,39 @@ class WakeWordTranslationAssistant:
         self.translation.translate_transcription(transcription)
         return None
 
+    def _handle_detect_mode(self):
+        if self.translation.tts:
+            self.translation.tts.start("Detecting text.", timeout_s=self.tts_timeout)
+
+        try:
+            text = self.ocr_scanner.scan_once(save_debug=True)
+        except Exception as e:
+            if self.translation.tts:
+                self.translation.tts.start("Camera or OCR failed.", timeout_s=self.tts_timeout)
+            print("Detect error:", e)
+            return
+
+        if not text:
+            if self.translation.tts:
+                self.translation.tts.start("No readable text found.", timeout_s=self.tts_timeout)
+            return
+
+        print("OCR text:\n", text)
+
+        # Translate (assume source is English for demo; later you can add language ID)
+        translated = self.translation.translator.translate(
+            text,
+            source_lang="en",
+            target_lang=self.translation.target_lang,  # or self.translation.target_lang if stored there
+        )
+
+        print("Translated:\n", translated)
+
+        # Speak or show overlay
+        if self.translation.tts:
+            # keep short so it doesn't ramble
+            self.translation.tts.start(translated[:220], timeout_s=self.tts_timeout)
+
     def _with_processing_lock(self, fn: Callable[[], None]) -> None:
         """Avoid overlapping wake-word callbacks."""
         with self._processing_lock:
@@ -290,12 +330,15 @@ class WakeWordTranslationAssistant:
                 if mode_intent == "detect":
                     if self.translation.source_lang != "en":
                         self.translation.delete_last_audio_file()
-                    if self.translation.tts:
+                    self._handle_detect_mode()
+                    if not self.stay_awake:
+                        return
+                    if self.prompt_user and self.translation.tts:
                         self.translation.tts.start(
-                            "Sign language detection pipeline is not ready yet.",
+                            "Say translate or detect to continue, or say stop listening to finish.",
                             timeout_s=self.tts_timeout,
                         )
-                    return
+                    continue
 
                 if self.translation.source_lang != "en":
                     self.translation.delete_last_audio_file()
