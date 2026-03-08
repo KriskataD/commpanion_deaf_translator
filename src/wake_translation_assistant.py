@@ -195,12 +195,13 @@ class WakeWordTranslationAssistant:
 
         print("OCR text:\n", text)
 
-        # Translate (assume source is English for demo; later you can add language ID)
-        translated = self.translation.translator.translate(
-            text,
-            source_lang="en",
-            target_lang=self.translation.target_lang,  # or self.translation.target_lang if stored there
-        )
+        # Temporarily force OCR source language for demo (English)
+        old_src = self.translation.source_lang
+        try:
+            self.translation.source_lang = "en"
+            translated = self.translation.translate_text(text)  # will also send captions
+        finally:
+            self.translation.source_lang = old_src
 
         print("Translated:\n", translated)
 

@@ -21,7 +21,7 @@ from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
 from .npu.whisper_qnn_stt import WhisperQnnSTT
 from .recorder import AudioRecorder
 from .tts import _TTS
-
+from .captions_client import CaptionsClient
 
 class MultiLanguageTranslator:
     """Wrapper around the facebook/m2m100_418M translation model."""
@@ -30,6 +30,7 @@ class MultiLanguageTranslator:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer = M2M100Tokenizer.from_pretrained(model_name)
         self.model = M2M100ForConditionalGeneration.from_pretrained(model_name).to(self.device)
+        self.captions = CaptionsClient(port=37777)
 
     def supported_languages(self) -> list[str]:
         """Return the language codes supported by the tokenizer/model."""
@@ -186,6 +187,8 @@ class TranslatorPipeline:
 
     def translate_transcription(self, transcription: str) -> str:
         translated = self.translator.translate(transcription, self.source_lang, self.target_lang)
+        if translated:
+            self.captions.send(translated, ttl_ms=9000)
         if self.speak and translated and self.tts:
             self.tts.start(translated, timeout_s=self.tts_timeout)
         print(f"➡️  Translated ({self.source_lang} → {self.target_lang}): {translated}")
@@ -195,6 +198,8 @@ class TranslatorPipeline:
         """Translate arbitrary text without invoking the STT step."""
 
         translated = self.translator.translate(text, self.source_lang, self.target_lang)
+        if translated:
+            self.captions.send(translated, ttl_ms=9000)
         if self.speak and translated and self.tts:
             self.tts.start(translated, timeout_s=self.tts_timeout)
         print(f"➡️  Translated text ({self.source_lang} → {self.target_lang}): {translated}")
