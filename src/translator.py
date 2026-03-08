@@ -30,7 +30,6 @@ class MultiLanguageTranslator:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer = M2M100Tokenizer.from_pretrained(model_name)
         self.model = M2M100ForConditionalGeneration.from_pretrained(model_name).to(self.device)
-        self.captions = CaptionsClient(port=37777)
 
     def supported_languages(self) -> list[str]:
         """Return the language codes supported by the tokenizer/model."""
@@ -83,6 +82,12 @@ class TranslatorPipeline:
         self.stt = self._build_stt_backend(qnn_encoder_dir, qnn_decoder_dir)
         self.translator = MultiLanguageTranslator()
         self.tts = _TTS() if self.speak else None
+        # captions overlay client (optional)
+        try:
+            self.captions = CaptionsClient(port=37777)
+        except Exception as e:
+            self.logger.warning("Captions disabled: %s", e)
+            self.captions = None
         self.last_audio_path: Path | None = None
 
         self._mic_lock = threading.Lock()
@@ -187,7 +192,7 @@ class TranslatorPipeline:
 
     def translate_transcription(self, transcription: str) -> str:
         translated = self.translator.translate(transcription, self.source_lang, self.target_lang)
-        if translated:
+        if translated and self.captions:
             self.captions.send(translated, ttl_ms=9000)
         if self.speak and translated and self.tts:
             self.tts.start(translated, timeout_s=self.tts_timeout)
@@ -198,7 +203,7 @@ class TranslatorPipeline:
         """Translate arbitrary text without invoking the STT step."""
 
         translated = self.translator.translate(text, self.source_lang, self.target_lang)
-        if translated:
+        if translated and self.captions:
             self.captions.send(translated, ttl_ms=9000)
         if self.speak and translated and self.tts:
             self.tts.start(translated, timeout_s=self.tts_timeout)
