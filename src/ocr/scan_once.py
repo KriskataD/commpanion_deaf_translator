@@ -8,12 +8,10 @@ from src.ocr.easyocr_qnn import EasyOcrQnn
 
 
 def _open_camera(cam_id: int = 0):
-    # Windows: DSHOW avoids read() hangs for many setups
-    for backend in [cv2.CAP_DSHOW, cv2.CAP_MSMF, 0]:
-        cap = cv2.VideoCapture(cam_id, backend) if backend != 0 else cv2.VideoCapture(cam_id)
-        if cap.isOpened():
-            return cap
-    raise RuntimeError(f"Could not open camera {cam_id}")
+    cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW)
+    if cap.isOpened():
+        return cap
+    raise RuntimeError(f"Could not open camera {cam_id} with CAP_DSHOW")
 
 
 def _sharpness_score(frame_bgr: np.ndarray) -> float:

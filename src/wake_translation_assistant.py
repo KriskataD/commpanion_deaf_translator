@@ -47,7 +47,7 @@ class WakeWordTranslationAssistant:
         self.ocr_scanner = OcrScanner(
             detector_onnx="src/models/easyocr_detector_float_optimized_onnx/model.onnx",
             recognizer_onnx="src/models/easyocr_recognizer_float_optimized_onnx/model.onnx",
-            camera_id=0,
+            camera_id=1,
         )
 
         self.translation = TranslatorPipeline(
