@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 scripts/
 captured/
+tmp/
 # Ignore generated/exported assets
 export_assets/
 

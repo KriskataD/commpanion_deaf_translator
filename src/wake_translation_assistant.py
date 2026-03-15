@@ -38,6 +38,8 @@ class WakeWordTranslationAssistant:
         stay_awake: bool = False,
         stt_timeout: float | None = None,
         tts_timeout: float | None = None,
+        launch_captions_overlay: bool = False,
+        captions_monitor_index: int | None = None,
     ) -> None:
         WakeWordDetector.download_models()
 
@@ -60,6 +62,8 @@ class WakeWordTranslationAssistant:
             stt_model=stt_model,
             stt_timeout=stt_timeout,
             tts_timeout=tts_timeout,
+            launch_captions_overlay=launch_captions_overlay,
+            captions_monitor_index=captions_monitor_index,
         )
         self.prompt_user = prompt_user
         self.stay_awake = stay_awake
@@ -375,6 +379,8 @@ class WakeWordTranslationAssistant:
             self.detector.stop()
             self.detector.cleanup()
             self.translation.recorder.cleanup()
+            # Full program shutdown only
+            self.translation.shutdown_captions_overlay()
 
 
 def main() -> None:
@@ -457,6 +463,8 @@ def main() -> None:
         type=float,
         help="Optional timeout (seconds) for TTS playback to avoid hangs.",
     )
+    parser.add_argument("--captions-auto-start", action="store_true", help="Launch captions overlay automatically.")
+    parser.add_argument("--captions-monitor-index", type=int, default=None, help="Windows monitor index for captions overlay.")
     args = parser.parse_args()
 
     default_small_encoder = "models/whisper_small_quantized_encoder_optimized_onnx"
@@ -486,6 +494,8 @@ def main() -> None:
         stay_awake=args.stay_awake,
         stt_timeout=args.stt_timeout,
         tts_timeout=args.tts_timeout,
+        launch_captions_overlay=args.captions_auto_start,
+        captions_monitor_index=args.captions_monitor_index,
     )
     assistant.run()
 

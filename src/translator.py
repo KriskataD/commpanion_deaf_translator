@@ -18,6 +18,9 @@ from typing import Callable, Optional
 import torch
 from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
 
+import subprocess
+import sys
+
 from .npu.whisper_qnn_stt import WhisperQnnSTT
 from .recorder import AudioRecorder
 from .tts import _TTS
@@ -66,6 +69,8 @@ class TranslatorPipeline:
         stt_model: str = "auto",
         stt_timeout: float | None = None,
         tts_timeout: float | None = None,
+        launch_captions_overlay: bool = False,
+        captions_monitor_index: int | None = None,
     ) -> None:
         self.audio_dir = Path(audio_dir)
         self.audio_dir.mkdir(parents=True, exist_ok=True)
@@ -82,6 +87,14 @@ class TranslatorPipeline:
         self.stt = self._build_stt_backend(qnn_encoder_dir, qnn_decoder_dir)
         self.translator = MultiLanguageTranslator()
         self.tts = _TTS() if self.speak else None
+
+        self._captions_overlay_proc = None
+        if launch_captions_overlay:
+            self._captions_overlay_proc = self._launch_captions_overlay(
+                port=37777,
+                monitor_index=captions_monitor_index,
+            )
+
         # captions overlay client (optional)
         try:
             self.captions = CaptionsClient(port=37777)
@@ -252,6 +265,61 @@ class TranslatorPipeline:
         except KeyboardInterrupt:
             print("\n🛑 Translation loop interrupted by user.")
 
+    def _launch_captions_overlay(self, port: int, monitor_index: int | None):
+        project_root = Path(__file__).resolve().parent.parent
+
+        exe = Path(sys.executable)
+        pythonw = exe.with_name("pythonw.exe")
+        launcher = str(pythonw if pythonw.exists() else exe)
+
+        cmd = [
+            launcher,
+            "-m",
+            "src.captions_overlay",
+            "--port",
+            str(port),
+            "--font-size",
+            "36",
+            "--width",
+            "1400",
+            "--height",
+            "140",
+            "--prefer-non-primary",
+        ]
+
+        if monitor_index is not None:
+            cmd.extend(["--monitor-index", str(monitor_index)])
+
+        return subprocess.Popen(cmd, cwd=str(project_root))
+    
+    def shutdown_captions_overlay(self) -> None:
+        proc = getattr(self, "_captions_overlay_proc", None)
+        if proc is None:
+            return
+
+        try:
+            if proc.poll() is None:  # still running
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
+        except Exception as e:
+            self.logger.warning("Failed to close captions overlay: %s", e)
+        finally:
+            self._captions_overlay_proc = None
+
+    def clear_captions(self) -> None:
+        try:
+            if getattr(self, "captions", None):
+                self.captions.clear()
+        except Exception:
+            pass
+
 
 def _print_language_list(translator: MultiLanguageTranslator) -> None:
     print("Supported language codes (M2M100):")
@@ -298,6 +366,9 @@ def main() -> None:
         action="store_true",
         help="Run a single record/transcribe/translate cycle instead of a loop.",
     )
+    parser.add_argument("--captions-auto-start", action="store_true", help="Launch captions overlay automatically.")
+    parser.add_argument("--captions-monitor-index", type=int, default=None, help="Windows monitor index for captions overlay.")
+
 
     args = parser.parse_args()
 
@@ -320,6 +391,8 @@ def main() -> None:
         qnn_decoder_dir=args.qnn_decoder_dir,
         stt_model=args.stt_model,
         stt_timeout=args.stt_timeout,
+        launch_captions_overlay=args.captions_auto_start,
+        captions_monitor_index=args.captions_monitor_index,
     )
 
     if args.list_languages:

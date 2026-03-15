@@ -8,8 +8,121 @@ import socket
 import threading
 import tkinter as tk
 
+import ctypes
+from ctypes import wintypes
+from dataclasses import dataclass
+
 DEFAULT_PORT = 37777
 
+MONITORINFOF_PRIMARY = 1
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", wintypes.LONG),
+        ("top", wintypes.LONG),
+        ("right", wintypes.LONG),
+        ("bottom", wintypes.LONG),
+    ]
+
+
+class MONITORINFOEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", RECT),
+        ("rcWork", RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", wintypes.WCHAR * 32),
+    ]
+
+
+@dataclass
+class MonitorInfo:
+    index: int
+    device: str
+    left: int
+    top: int
+    right: int
+    bottom: int
+    work_left: int
+    work_top: int
+    work_right: int
+    work_bottom: int
+    is_primary: bool
+
+    @property
+    def width(self) -> int:
+        return self.right - self.left
+
+    @property
+    def height(self) -> int:
+        return self.bottom - self.top
+
+    @property
+    def work_width(self) -> int:
+        return self.work_right - self.work_left
+
+    @property
+    def work_height(self) -> int:
+        return self.work_bottom - self.work_top
+
+
+def list_windows_monitors() -> list[MonitorInfo]:
+    if not hasattr(ctypes, "windll"):
+        return []
+
+    user32 = ctypes.windll.user32
+    raw: list[tuple[str, int, int, int, int, int, int, int, int, bool]] = []
+
+    MONITORENUMPROC = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HMONITOR,
+        wintypes.HDC,
+        ctypes.POINTER(RECT),
+        wintypes.LPARAM,
+    )
+
+    def _callback(hmonitor, hdc, lprc, lparam):
+        info = MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+        ok = user32.GetMonitorInfoW(hmonitor, ctypes.byref(info))
+        if ok:
+            raw.append(
+                (
+                    info.szDevice,
+                    info.rcMonitor.left,
+                    info.rcMonitor.top,
+                    info.rcMonitor.right,
+                    info.rcMonitor.bottom,
+                    info.rcWork.left,
+                    info.rcWork.top,
+                    info.rcWork.right,
+                    info.rcWork.bottom,
+                    bool(info.dwFlags & MONITORINFOF_PRIMARY),
+                )
+            )
+        return True
+
+    user32.EnumDisplayMonitors(0, 0, MONITORENUMPROC(_callback), 0)
+
+    raw.sort(key=lambda m: (m[1], m[2]))  # left-to-right, then top-to-bottom
+
+    return [
+        MonitorInfo(
+            index=i,
+            device=item[0],
+            left=item[1],
+            top=item[2],
+            right=item[3],
+            bottom=item[4],
+            work_left=item[5],
+            work_top=item[6],
+            work_right=item[7],
+            work_bottom=item[8],
+            is_primary=item[9],
+        )
+        for i, item in enumerate(raw)
+    ]
 
 class CaptionOverlayApp:
     """
@@ -28,9 +141,22 @@ class CaptionOverlayApp:
         font_size: int = 36,
         width: int = 1400,
         height: int = 140,
-        opacity: float | None = None,  # e.g. 0.90 or None
+        opacity: float | None = None,
         host: str = "127.0.0.1",
+        monitor_index: int | None = None,
+        prefer_non_primary: bool = False,
+        x_offset: int = 0,
+        y_offset: int = 0,
+        bottom_margin: int = 80,
     ) -> None:
+        self.width = width
+        self.height = height
+        self.monitor_index = monitor_index
+        self.prefer_non_primary = prefer_non_primary
+        self.x_offset = x_offset
+        self.y_offset = y_offset
+        self.bottom_margin = bottom_margin
+
         self.root = tk.Tk()
         self.root.title("Commpanion Captions")
 
@@ -83,12 +209,9 @@ class CaptionOverlayApp:
         self.msg_q: queue.Queue[dict] = queue.Queue()
         self._start_udp_listener(host=host, port=port)
 
-        # Initial position: bottom center-ish on *primary* screen (drag to AR display after)
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        x = max(0, (sw - width) // 2)
-        y = max(0, sh - height - 80)
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self._place_initial_window()
+        self.root.after(1500, self._place_initial_window)  # retry in case VDM finishes a bit later
+        self.root.after(4000, self._place_initial_window)  # second retry
 
         # Keep wraplength consistent if you later change geometry
         self.root.bind("<Configure>", self._on_configure)
@@ -203,6 +326,44 @@ class CaptionOverlayApp:
 
         self.root.after(30, self._poll)
 
+    def _select_monitor(self) -> MonitorInfo | None:
+        monitors = list_windows_monitors()
+        if not monitors:
+            return None
+
+        if self.monitor_index is not None:
+            for mon in monitors:
+                if mon.index == self.monitor_index:
+                    return mon
+
+        if self.prefer_non_primary:
+            for mon in monitors:
+                if not mon.is_primary:
+                    return mon
+
+        for mon in monitors:
+            if mon.is_primary:
+                return mon
+
+        return monitors[0]
+
+    def _place_initial_window(self) -> None:
+        mon = self._select_monitor()
+
+        if mon is None:
+            # fallback to original behavior
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            x = max(0, (sw - self.width) // 2) + self.x_offset
+            y = max(0, sh - self.height - self.bottom_margin) + self.y_offset
+        else:
+            x = mon.work_left + max(0, (mon.work_width - self.width) // 2) + self.x_offset
+            y = mon.work_bottom - self.height - self.bottom_margin + self.y_offset
+
+        self.root.geometry(f"{self.width}x{self.height}+{x}+{y}")
+        self.root.update_idletasks()
+        self.root.lift()
+
     def run(self) -> None:
         self.root.mainloop()
 
@@ -215,7 +376,29 @@ def main() -> None:
     ap.add_argument("--height", type=int, default=140)
     ap.add_argument("--opacity", type=float, default=None, help="e.g. 0.9 (optional)")
     ap.add_argument("--host", type=str, default="127.0.0.1")
+
+    ap.add_argument("--monitor-index", type=int, default=None, help="Windows monitor index from --list-monitors.")
+    ap.add_argument("--prefer-non-primary", action="store_true", help="Place on first non-primary monitor.")
+    ap.add_argument("--x-offset", type=int, default=0)
+    ap.add_argument("--y-offset", type=int, default=0)
+    ap.add_argument("--bottom-margin", type=int, default=80)
+    ap.add_argument("--list-monitors", action="store_true")
+
     args = ap.parse_args()
+
+    if args.list_monitors:
+        monitors = list_windows_monitors()
+        if not monitors:
+            print("No Windows monitor info available.")
+        else:
+            for m in monitors:
+                print(
+                    f"[{m.index}] {m.device} "
+                    f"monitor=({m.left},{m.top})-({m.right},{m.bottom}) "
+                    f"work=({m.work_left},{m.work_top})-({m.work_right},{m.work_bottom}) "
+                    f"primary={m.is_primary}"
+                )
+        return
 
     CaptionOverlayApp(
         port=args.port,
@@ -224,6 +407,11 @@ def main() -> None:
         height=args.height,
         opacity=args.opacity,
         host=args.host,
+        monitor_index=args.monitor_index,
+        prefer_non_primary=args.prefer_non_primary,
+        x_offset=args.x_offset,
+        y_offset=args.y_offset,
+        bottom_margin=args.bottom_margin,
     ).run()
 
 
