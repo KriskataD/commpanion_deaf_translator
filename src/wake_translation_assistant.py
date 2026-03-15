@@ -93,6 +93,23 @@ class WakeWordTranslationAssistant:
         self._should_exit = False
 
     @staticmethod
+    def _pretty_wakeword_label(wakeword: str) -> str:
+        return Path(wakeword).stem.replace("_", " ").replace("-", " ").strip().title()
+
+    def _show_idle_wake_caption(self) -> None:
+        if not self.wakeword_models:
+            wake_phrase = '"Hey Jarvis"'
+        else:
+            wake_phrase = " or ".join(
+                f'"{self._pretty_wakeword_label(w)}"' for w in self.wakeword_models
+            )
+
+        self.translation.show_caption(
+            f"Say {wake_phrase} to wake up the pipeline.",
+            ttl_ms=None,   # persistent until replaced/cleared
+        )
+
+    @staticmethod
     def _get_stop_intent(transcription: str) -> str | None:
         normalized = " ".join(transcription.lower().split())
         if "stop jarvis" in normalized:
@@ -117,7 +134,7 @@ class WakeWordTranslationAssistant:
 
     def _handle_translate_mode(self) -> str | None:
         if self.translation.tts:
-            self.translation.tts.start(
+            self.translation.speak_text(
                 "Ready to translate. Please say what you want translated.",
                 timeout_s=self.tts_timeout,
             )
@@ -128,7 +145,7 @@ class WakeWordTranslationAssistant:
         if not audio_path:
             self.logger.warning("No audio captured for translation.")
             if self.translation.tts:
-                self.translation.tts.start(
+                self.translation.speak_text(
                     "I did not catch anything to translate. Please try again.",
                     timeout_s=self.tts_timeout,
                 )
@@ -140,7 +157,7 @@ class WakeWordTranslationAssistant:
         except Exception:
             self.logger.exception("Translation transcription failed.")
             if self.translation.tts:
-                self.translation.tts.start(
+                self.translation.speak_text(
                     "I had trouble understanding that. Please try again.",
                     timeout_s=self.tts_timeout,
                 )
@@ -149,7 +166,7 @@ class WakeWordTranslationAssistant:
             if self.translation.source_lang != "en":
                 self.translation.delete_last_audio_file()
             if self.translation.tts:
-                self.translation.tts.start(
+                self.translation.speak_text(
                     "I did not catch that. Please try again.",
                     timeout_s=self.tts_timeout,
                 )
@@ -165,12 +182,12 @@ class WakeWordTranslationAssistant:
         if stop_intent:
             if self.translation.tts:
                 if stop_intent == "stop_program":
-                    self.translation.tts.start(
+                    self.translation.speak_text(
                         "Stopping. Goodbye.",
                         timeout_s=self.tts_timeout,
                     )
                 else:
-                    self.translation.tts.start(
+                    self.translation.speak_text(
                         "Stopping. Say the wake word when you need me again.",
                         timeout_s=self.tts_timeout,
                     )
@@ -182,19 +199,19 @@ class WakeWordTranslationAssistant:
 
     def _handle_detect_mode(self):
         if self.translation.tts:
-            self.translation.tts.start("Detecting text.", timeout_s=self.tts_timeout)
+            self.translation.speak_text("Detecting text.", timeout_s=self.tts_timeout)
 
         try:
             text = self.ocr_scanner.scan_once(save_debug=True)
         except Exception as e:
             if self.translation.tts:
-                self.translation.tts.start("Camera or OCR failed.", timeout_s=self.tts_timeout)
+                self.translation.speak_text("Camera or OCR failed.", timeout_s=self.tts_timeout)
             print("Detect error:", e)
             return
 
         if not text:
             if self.translation.tts:
-                self.translation.tts.start("No readable text found.", timeout_s=self.tts_timeout)
+                self.translation.speak_text("No readable text found.", timeout_s=self.tts_timeout)
             return
 
         print("OCR text:\n", text)
@@ -212,7 +229,7 @@ class WakeWordTranslationAssistant:
         # Speak or show overlay
         if self.translation.tts:
             # keep short so it doesn't ramble
-            self.translation.tts.start(translated[:220], timeout_s=self.tts_timeout)
+            self.translation.speak_text(translated[:220], timeout_s=self.tts_timeout)
 
     def _with_processing_lock(self, fn: Callable[[], None]) -> None:
         """Avoid overlapping wake-word callbacks."""
@@ -231,6 +248,7 @@ class WakeWordTranslationAssistant:
 
     def _on_wake_word_detected(self, wakeword: str, score: float) -> None:
         self.logger.info("Wake word '%s' detected (score: %.2f)", wakeword, score)
+        self.translation.clear_captions()
         self._with_processing_lock(self._handle_request)
 
     def _handle_request(self) -> None:
@@ -244,7 +262,7 @@ class WakeWordTranslationAssistant:
                     if not self.stay_awake
                     else "Ready. Say translate to translate or detect for sign language. Say stop listening to finish."
                 )
-                self.translation.tts.start(prompt_text, timeout_s=self.tts_timeout)
+                self.translation.speak_text(prompt_text, timeout_s=self.tts_timeout)
                 self.logger.info("Prompt completed. Starting recording.")
 
             while True:
@@ -264,7 +282,7 @@ class WakeWordTranslationAssistant:
                 except Exception:
                     self.logger.exception("Wake word transcription failed.")
                     if self.translation.tts:
-                        self.translation.tts.start(
+                        self.translation.speak_text(
                             "I had trouble understanding that. Please try again.",
                             timeout_s=self.tts_timeout,
                         )
@@ -273,7 +291,7 @@ class WakeWordTranslationAssistant:
                     if self.translation.source_lang != "en":
                         self.translation.delete_last_audio_file()
                     if self.translation.tts:
-                        self.translation.tts.start(
+                        self.translation.speak_text(
                             "I did not catch that. Please try again.",
                             timeout_s=self.tts_timeout,
                         )
@@ -289,12 +307,12 @@ class WakeWordTranslationAssistant:
                         self.translation.delete_last_audio_file()
                     if self.translation.tts:
                         if stop_intent == "stop_program":
-                            self.translation.tts.start(
+                            self.translation.speak_text(
                                 "Stopping. Goodbye.",
                                 timeout_s=self.tts_timeout,
                             )
                         else:
-                            self.translation.tts.start(
+                            self.translation.speak_text(
                                 "Stopping. Say the wake word when you need me again.",
                                 timeout_s=self.tts_timeout,
                             )
@@ -308,12 +326,12 @@ class WakeWordTranslationAssistant:
                     if stop_intent:
                         if self.translation.tts:
                             if stop_intent == "stop_program":
-                                self.translation.tts.start(
+                                self.translation.speak_text(
                                     "Stopping. Goodbye.",
                                     timeout_s=self.tts_timeout,
                                 )
                             else:
-                                self.translation.tts.start(
+                                self.translation.speak_text(
                                     "Stopping. Say the wake word when you need me again.",
                                     timeout_s=self.tts_timeout,
                                 )
@@ -326,7 +344,7 @@ class WakeWordTranslationAssistant:
                 mode_intent = self._get_mode_intent(command_for_mode)
                 if not mode_intent:
                     if self.translation.tts:
-                        self.translation.tts.start(
+                        self.translation.speak_text(
                             "Please say translate or detect.",
                             timeout_s=self.tts_timeout,
                         )
@@ -339,7 +357,7 @@ class WakeWordTranslationAssistant:
                     if not self.stay_awake:
                         return
                     if self.prompt_user and self.translation.tts:
-                        self.translation.tts.start(
+                        self.translation.speak_text(
                             "Say translate or detect to continue, or say stop listening to finish.",
                             timeout_s=self.tts_timeout,
                         )
@@ -355,13 +373,14 @@ class WakeWordTranslationAssistant:
                 if not self.stay_awake:
                     return
                 if self.prompt_user and self.translation.tts:
-                    self.translation.tts.start(
+                    self.translation.speak_text(
                         "Say translate or detect to continue, or say stop listening to finish.",
                         timeout_s=self.tts_timeout,
                     )
         finally:
             if not self._should_exit:
                 self.detector.start()
+                self._show_idle_wake_caption()
 
     def run(self) -> None:
         """Start wake-word listening loop."""
@@ -371,6 +390,7 @@ class WakeWordTranslationAssistant:
         )
         try:
             self.detector.start()
+            self._show_idle_wake_caption()
             while not self._should_exit:
                 time.sleep(1)
         except KeyboardInterrupt:

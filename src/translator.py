@@ -206,12 +206,37 @@ class TranslatorPipeline:
         self.source_lang = source_lang
         self.target_lang = target_lang
 
+    def show_caption(self, text: str, ttl_ms: int | None = 9000) -> None:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return
+        try:
+            if getattr(self, "captions", None):
+                self.captions.send(cleaned, ttl_ms=ttl_ms)
+        except Exception as e:
+            self.logger.warning("Failed to send captions: %s", e)
+
+    def speak_text(
+        self,
+        text: str,
+        *,
+        timeout_s: float | None = None,
+        ttl_ms: int | None = 9000,
+    ) -> None:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return
+
+        # Always mirror spoken text to the captions overlay
+        self.show_caption(cleaned, ttl_ms=ttl_ms)
+
+        if self.speak and self.tts:
+            self.tts.start(cleaned, timeout_s=timeout_s)
+
     def translate_transcription(self, transcription: str) -> str:
         translated = self.translator.translate(transcription, self.source_lang, self.target_lang)
-        if translated and self.captions:
-            self.captions.send(translated, ttl_ms=9000)
-        if self.speak and translated and self.tts:
-            self.tts.start(translated, timeout_s=self.tts_timeout)
+        if translated:
+            self.speak_text(translated, timeout_s=self.tts_timeout, ttl_ms=9000)
         print(f"➡️  Translated ({self.source_lang} → {self.target_lang}): {translated}")
         return translated
 
@@ -219,10 +244,8 @@ class TranslatorPipeline:
         """Translate arbitrary text without invoking the STT step."""
 
         translated = self.translator.translate(text, self.source_lang, self.target_lang)
-        if translated and self.captions:
-            self.captions.send(translated, ttl_ms=9000)
-        if self.speak and translated and self.tts:
-            self.tts.start(translated, timeout_s=self.tts_timeout)
+        if translated:
+            self.speak_text(translated, timeout_s=self.tts_timeout, ttl_ms=9000)
         print(f"➡️  Translated text ({self.source_lang} → {self.target_lang}): {translated}")
         return translated
 
