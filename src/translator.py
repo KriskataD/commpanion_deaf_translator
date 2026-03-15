@@ -307,10 +307,13 @@ class TranslatorPipeline:
             "--font-size",
             "36",
             "--width",
-            "1400",
+            "1900",
             "--height",
             "140",
             "--prefer-non-primary",
+            "--cover-taskbar",
+            "--bottom-margin",
+            "0",
         ]
 
         if monitor_index is not None:

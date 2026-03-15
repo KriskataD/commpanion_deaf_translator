@@ -57,15 +57,7 @@ You can still override model directories with `--qnn-encoder-dir` and `--qnn-dec
 
 To run the full pipeline:
 ```bash
-python -m src.wake_translation_assistant \
-  --source-lang bg \
-  --target-lang en \
-  --qnn-encoder-dir models/whisper_small_quantized_encoder_optimized_onnx \
-  --qnn-decoder-dir models/whisper_small_quantized_decoder_optimized_onnx \
-  --wakeword hey_jarvis \
-  --stay-awake \
-  --no-prompt \
-  --tts-timeout 5
+python -m src.wake_translation_assistant   --source-lang bg   --target-lang en   --wakeword hey_jarvis   --stay-awake   --tts-timeout 30   --stt-model large-v3-turbo   --captions-auto-start   --captions-monitor-index 1
 ```
 
 ## Notes

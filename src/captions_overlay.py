@@ -148,6 +148,7 @@ class CaptionOverlayApp:
         x_offset: int = 0,
         y_offset: int = 0,
         bottom_margin: int = 80,
+        cover_taskbar: bool = False,
     ) -> None:
         self.width = width
         self.height = height
@@ -156,6 +157,7 @@ class CaptionOverlayApp:
         self.x_offset = x_offset
         self.y_offset = y_offset
         self.bottom_margin = bottom_margin
+        self.cover_taskbar = cover_taskbar
 
         self.root = tk.Tk()
         self.root.title("Commpanion Captions")
@@ -367,12 +369,22 @@ class CaptionOverlayApp:
             x = max(0, (sw - self.width) // 2) + self.x_offset
             y = max(0, sh - self.height - self.bottom_margin) + self.y_offset
         else:
-            x = mon.work_left + max(0, (mon.work_width - self.width) // 2) + self.x_offset
-            y = mon.work_bottom - self.height - self.bottom_margin + self.y_offset
+            if self.cover_taskbar:
+                area_left = mon.left
+                area_width = mon.width
+                area_bottom = mon.bottom
+            else:
+                area_left = mon.work_left
+                area_width = mon.work_width
+                area_bottom = mon.work_bottom
+
+            x = area_left + max(0, (area_width - self.width) // 2) + self.x_offset
+            y = area_bottom - self.height - self.bottom_margin + self.y_offset
 
         self.root.geometry(f"{self.width}x{self.height}+{x}+{y}")
         self.root.update_idletasks()
         self.root.lift()
+        self.root.attributes("-topmost", True)
 
     def run(self) -> None:
         self.root.mainloop()
@@ -393,6 +405,8 @@ def main() -> None:
     ap.add_argument("--y-offset", type=int, default=0)
     ap.add_argument("--bottom-margin", type=int, default=80)
     ap.add_argument("--list-monitors", action="store_true")
+
+    ap.add_argument("--cover-taskbar", action="store_true", help="Place overlay over the full monitor area, including the Windows taskbar.")
 
     args = ap.parse_args()
 
@@ -422,6 +436,7 @@ def main() -> None:
         x_offset=args.x_offset,
         y_offset=args.y_offset,
         bottom_margin=args.bottom_margin,
+        cover_taskbar=args.cover_taskbar,
     ).run()
 
 
