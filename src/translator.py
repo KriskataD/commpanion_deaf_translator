@@ -90,10 +90,13 @@ class TranslatorPipeline:
 
         self._captions_overlay_proc = None
         if launch_captions_overlay:
-            self._captions_overlay_proc = self._launch_captions_overlay(
-                port=37777,
-                monitor_index=captions_monitor_index,
-            )
+            self._kill_stale_captions_overlays()
+
+            if self._captions_overlay_proc is None or self._captions_overlay_proc.poll() is not None:
+                self._captions_overlay_proc = self._launch_captions_overlay(
+                    port=37777,
+                    monitor_index=captions_monitor_index,
+                )
 
         # captions overlay client (optional)
         try:
@@ -293,12 +296,11 @@ class TranslatorPipeline:
         return subprocess.Popen(cmd, cwd=str(project_root))
     
     def shutdown_captions_overlay(self) -> None:
-        proc = getattr(self, "_captions_overlay_proc", None)
-        if proc is None:
-            return
+        self.clear_captions()
 
+        proc = getattr(self, "_captions_overlay_proc", None)
         try:
-            if proc.poll() is None:  # still running
+            if proc is not None and proc.poll() is None:
                 proc.terminate()
                 try:
                     proc.wait(timeout=2)
@@ -309,9 +311,11 @@ class TranslatorPipeline:
                     except Exception:
                         pass
         except Exception as e:
-            self.logger.warning("Failed to close captions overlay: %s", e)
+            self.logger.warning("Failed to close tracked captions overlay: %s", e)
         finally:
             self._captions_overlay_proc = None
+
+        self._kill_stale_captions_overlays()
 
     def clear_captions(self) -> None:
         try:
@@ -319,6 +323,31 @@ class TranslatorPipeline:
                 self.captions.clear()
         except Exception:
             pass
+
+    def _kill_stale_captions_overlays(self) -> None:
+        if os.name != "nt":
+            return
+
+        script = r"""
+    $procs = Get-CimInstance Win32_Process | Where-Object {
+        $_.CommandLine -and (
+            $_.CommandLine -match 'src\.captions_overlay' -or
+            $_.CommandLine -match 'captions_overlay\.py'
+        )
+    }
+    foreach ($p in $procs) {
+        try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {}
+    }
+    """
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            self.logger.warning("Failed to sweep stale caption overlays: %s", e)
 
 
 def _print_language_list(translator: MultiLanguageTranslator) -> None:

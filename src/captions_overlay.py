@@ -292,7 +292,12 @@ class CaptionOverlayApp:
     def _start_udp_listener(self, host: str, port: int) -> None:
         def worker():
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.bind((host, int(port)))
+            try:
+                sock.bind((host, int(port)))
+            except OSError as e:
+                self.msg_q.put({"__bind_error__": str(e)})
+                return
+
             while True:
                 try:
                     data, _ = sock.recvfrom(65535)
@@ -300,7 +305,6 @@ class CaptionOverlayApp:
                     if isinstance(payload, dict):
                         self.msg_q.put(payload)
                 except Exception:
-                    # Keep running even if a message is malformed
                     continue
 
         t = threading.Thread(target=worker, daemon=True)
@@ -313,6 +317,12 @@ class CaptionOverlayApp:
         try:
             while True:
                 payload = self.msg_q.get_nowait()
+
+                if "__bind_error__" in payload:
+                    print(f"Captions overlay bind failed: {payload['__bind_error__']}")
+                    self.root.after(0, self.root.destroy)
+                    return
+
                 text = str(payload.get("text", ""))
                 clear = bool(payload.get("clear", False))
                 ttl_ms = payload.get("ttl_ms", None)
