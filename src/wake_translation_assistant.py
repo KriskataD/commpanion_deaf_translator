@@ -218,7 +218,7 @@ class WakeWordTranslationAssistant:
                     "Translation failed.",
                     timeout_s=self.tts_timeout,
                     ttl_ms=2000,
-                    show_caption=False,
+                    show_caption=True,
                 )
                 self._show_current_ocr_page()
             return
@@ -231,7 +231,7 @@ class WakeWordTranslationAssistant:
             self.translation.speak_text(
                 "Ready to translate. Please say what you want translated.",
                 timeout_s=self.tts_timeout,
-                show_caption=False,
+                show_caption=True,
             )
         time.sleep(0.1)
         audio_path = self.translation.record(filename="last_rec.wav")
@@ -243,7 +243,7 @@ class WakeWordTranslationAssistant:
                 self.translation.speak_text(
                     "I did not catch anything to translate. Please try again.",
                     timeout_s=self.tts_timeout,
-                    show_caption=False,
+                    show_caption=True,
                 )
             return None
 
@@ -256,7 +256,7 @@ class WakeWordTranslationAssistant:
                 self.translation.speak_text(
                     "I had trouble understanding that. Please try again.",
                     timeout_s=self.tts_timeout,
-                    show_caption=False,
+                    show_caption=True,
                 )
             return None
         if not transcription or not transcription.strip():
@@ -266,7 +266,7 @@ class WakeWordTranslationAssistant:
                 self.translation.speak_text(
                     "I did not catch that. Please try again.",
                     timeout_s=self.tts_timeout,
-                    show_caption=False,
+                    show_caption=True,
                 )
             return None
 
@@ -283,13 +283,13 @@ class WakeWordTranslationAssistant:
                     self.translation.speak_text(
                         "Stopping. Goodbye.",
                         timeout_s=self.tts_timeout,
-                        show_caption=False,
+                        show_caption=True,
                     )
                 else:
                     self.translation.speak_text(
                         "Stopping. Say the wake word when you need me again.",
                         timeout_s=self.tts_timeout,
-                        show_caption=False,
+                        show_caption=True,
                     )
             return stop_intent
 
@@ -299,19 +299,19 @@ class WakeWordTranslationAssistant:
 
     def _handle_detect_mode(self):
         if self.translation.tts:
-            self.translation.speak_text("Detecting text.", timeout_s=self.tts_timeout, show_caption=False)
+            self.translation.speak_text("Detecting text.", timeout_s=self.tts_timeout, show_caption=True)
 
         try:
             text = self.ocr_scanner.scan_once(save_debug=True)
         except Exception as e:
             if self.translation.tts:
-                self.translation.speak_text("Camera or OCR failed.", timeout_s=self.tts_timeout, show_caption=False)
+                self.translation.speak_text("Camera or OCR failed.", timeout_s=self.tts_timeout, show_caption=True)
             print("Detect error:", e)
             return
 
         if not text:
             if self.translation.tts:
-                self.translation.speak_text("No readable text found.", timeout_s=self.tts_timeout, show_caption=False)
+                self.translation.speak_text("No readable text found.", timeout_s=self.tts_timeout, show_caption=True)
             return
 
         print("OCR text:\n", text)
@@ -322,7 +322,7 @@ class WakeWordTranslationAssistant:
 
         if not self._ocr_pages:
             if self.translation.tts:
-                self.translation.speak_text("Nothing to show.", timeout_s=self.tts_timeout, show_caption=False)
+                self.translation.speak_text("Nothing to show.", timeout_s=self.tts_timeout, show_caption=True)
             return
 
         self._show_current_ocr_page()
@@ -332,7 +332,7 @@ class WakeWordTranslationAssistant:
                 "Reading mode. Say next page, previous page, translate text, or stop reading.",
                 timeout_s=self.tts_timeout,
                 ttl_ms=2500,
-                show_caption=False,
+                show_caption=True,
             )
             self._show_current_ocr_page()
 
@@ -356,7 +356,7 @@ class WakeWordTranslationAssistant:
                         "Say next page, previous page, translate text, or stop reading.",
                         timeout_s=self.tts_timeout,
                         ttl_ms=2500,
-                        show_caption=False,
+                        show_caption=True,
                     )
                     self._show_current_ocr_page()
                 continue
@@ -395,7 +395,7 @@ class WakeWordTranslationAssistant:
                         "Stopped reading.",
                         timeout_s=self.tts_timeout,
                         ttl_ms=1500,
-                        show_caption=False,
+                        show_caption=True,
                     )
                 return
 
@@ -404,7 +404,7 @@ class WakeWordTranslationAssistant:
                     "Say next page, previous page, translate text, or stop reading.",
                     timeout_s=self.tts_timeout,
                     ttl_ms=2500,
-                    show_caption=False,
+                    show_caption=True,
                 )
                 self._show_current_ocr_page()
 
@@ -439,7 +439,7 @@ class WakeWordTranslationAssistant:
                     if not self.stay_awake
                     else "Ready. Say 'translate' for speech translation or 'detect' for text detection. Say stop listening to finish."
                 )
-                self.translation.speak_text(prompt_text, timeout_s=self.tts_timeout, show_caption=False)
+                self.translation.speak_text(prompt_text, timeout_s=self.tts_timeout, show_caption=True)
                 self.logger.info("Prompt completed. Starting recording.")
 
             while True:
@@ -462,7 +462,7 @@ class WakeWordTranslationAssistant:
                         self.translation.speak_text(
                             "I had trouble understanding that. Please try again.",
                             timeout_s=self.tts_timeout,
-                            show_caption=False,
+                            show_caption=True,
                         )
                     return
                 if not prompt or not prompt.strip():
@@ -472,7 +472,7 @@ class WakeWordTranslationAssistant:
                         self.translation.speak_text(
                             "I did not catch that. Please try again.",
                             timeout_s=self.tts_timeout,
-                            show_caption=False,
+                            show_caption=True,
                         )
                     return
 
@@ -489,13 +489,13 @@ class WakeWordTranslationAssistant:
                             self.translation.speak_text(
                                 "Stopping. Goodbye.",
                                 timeout_s=self.tts_timeout,
-                                show_caption=False,
+                                show_caption=True,
                             )
                         else:
                             self.translation.speak_text(
                                 "Stopping. Say the wake word when you need me again.",
                                 timeout_s=self.tts_timeout,
-                                show_caption=False,
+                                show_caption=True,
                             )
                     if stop_intent == "stop_program":
                         self._should_exit = True
@@ -510,13 +510,13 @@ class WakeWordTranslationAssistant:
                                 self.translation.speak_text(
                                     "Stopping. Goodbye.",
                                     timeout_s=self.tts_timeout,
-                                    show_caption=False,
+                                    show_caption=True,
                                 )
                             else:
                                 self.translation.speak_text(
                                     "Stopping. Say the wake word when you need me again.",
                                     timeout_s=self.tts_timeout,
-                                    show_caption=False,
+                                    show_caption=True,
                                 )
                         if stop_intent == "stop_program":
                             self._should_exit = True
@@ -530,7 +530,7 @@ class WakeWordTranslationAssistant:
                         self.translation.speak_text(
                             "Please say translate or detect.",
                             timeout_s=self.tts_timeout,
-                            show_caption=False,
+                            show_caption=True,
                         )
                     continue
 
@@ -544,7 +544,7 @@ class WakeWordTranslationAssistant:
                         self.translation.speak_text(
                             "Say translate or detect to continue, or say stop listening to finish.",
                             timeout_s=self.tts_timeout,
-                            show_caption=False,
+                            show_caption=True,
                         )
                     continue
 
@@ -561,7 +561,7 @@ class WakeWordTranslationAssistant:
                     self.translation.speak_text(
                         "Say translate or detect to continue, or say stop listening to finish.",
                         timeout_s=self.tts_timeout,
-                        show_caption=False,
+                        show_caption=True,
                     )
         finally:
             if not self._should_exit:
