@@ -206,13 +206,19 @@ class TranslatorPipeline:
         self.source_lang = source_lang
         self.target_lang = target_lang
 
-    def show_caption(self, text: str, ttl_ms: int | None = 9000) -> None:
+    def show_caption(
+        self,
+        text: str,
+        ttl_ms: int | None = 9000,
+        *,
+        format_text: bool = True,
+    ) -> None:
         cleaned = (text or "").strip()
         if not cleaned:
             return
         try:
             if getattr(self, "captions", None):
-                self.captions.send(cleaned, ttl_ms=ttl_ms)
+                self.captions.send(cleaned, ttl_ms=ttl_ms, format_text=format_text)
         except Exception as e:
             self.logger.warning("Failed to send captions: %s", e)
 
@@ -221,14 +227,15 @@ class TranslatorPipeline:
         text: str,
         *,
         timeout_s: float | None = None,
-        ttl_ms: int | None = 9000,
+        ttl_ms: float | None = 9000,
+        show_caption: bool = True,
     ) -> None:
         cleaned = (text or "").strip()
         if not cleaned:
             return
 
-        # Always mirror spoken text to the captions overlay
-        self.show_caption(cleaned, ttl_ms=ttl_ms)
+        if show_caption:
+            self.show_caption(cleaned, ttl_ms=ttl_ms)
 
         if self.speak and self.tts:
             self.tts.start(cleaned, timeout_s=timeout_s)
