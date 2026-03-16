@@ -73,8 +73,6 @@ class WakeWordTranslationAssistant:
         self._ocr_page_index = 0
         self._ocr_original_text = ""
         self._ocr_display_text = ""
-        self._ocr_pages: list[str] = []
-        self._ocr_page_index = 0
         self._ocr_is_translated = False
         default_mic = self.translation.recorder.mic_selector.get_default_microphone()
         default_wake_device = default_mic["index"] if default_mic else None
@@ -164,30 +162,6 @@ class WakeWordTranslationAssistant:
         ]
 
     @staticmethod
-    def _chunk_text_for_ocr_display(
-        text: str,
-        *,
-        max_chars_per_line: int = 48,
-        max_lines: int = 2,
-    ) -> list[str]:
-        cleaned = " ".join((text or "").split())
-        if not cleaned:
-            return []
-
-        lines = textwrap.wrap(
-            cleaned,
-            width=max_chars_per_line,
-            break_long_words=False,
-            break_on_hyphens=False,
-        )
-
-        return [
-            "\n".join(lines[i:i + max_lines])
-            for i in range(0, len(lines), max_lines)
-        ]
-
-
-    @staticmethod
     def _get_ocr_command(transcription: str) -> str | None:
         normalized = " ".join((transcription or "").lower().split())
 
@@ -251,97 +225,6 @@ class WakeWordTranslationAssistant:
 
         self._set_ocr_display_text(translated, translated=True)
         self._show_current_ocr_page()
-
-    @staticmethod
-    def _get_ocr_reading_command(transcription: str) -> str | None:
-        normalized = " ".join((transcription or "").lower().split())
-
-        if "stop reading" in normalized or normalized == "stop":
-            return "stop"
-
-        if (
-            "previous page" in normalized
-            or normalized == "previous"
-            or "go back" in normalized
-            or normalized == "back"
-        ):
-            return "previous"
-
-        if "next page" in normalized or normalized == "next":
-            return "next"
-
-        return None
-
-    def _show_current_ocr_page(self) -> None:
-        if not self._ocr_pages:
-            return
-
-        page = self._ocr_pages[self._ocr_page_index]
-        self.translation.show_caption(
-            page,
-            ttl_ms=None,
-            format_text=False,
-        )
-
-    def _run_ocr_reading_loop(self) -> None:
-        while True:
-            audio_path = self.translation.record(filename="ocr_command.wav")
-            if not audio_path:
-                continue
-
-            try:
-                command_text = self.translation.transcribe(
-                    language_override="en",
-                    delete=True,
-                )
-            except Exception:
-                self.logger.exception("OCR command transcription failed.")
-                if self.translation.tts:
-                    self.translation.speak_text(
-                        "Say next page, previous page, or stop reading.",
-                        timeout_s=self.tts_timeout,
-                        ttl_ms=2500,
-                        show_caption=False,
-                    )
-                    self._show_current_ocr_page()
-                continue
-
-            print(f"OCR command: {command_text}")
-            intent = self._get_ocr_reading_command(command_text)
-
-            if intent == "next":
-                if self._ocr_page_index < len(self._ocr_pages) - 1:
-                    self._ocr_page_index += 1
-                self._show_current_ocr_page()
-                continue
-
-            if intent == "previous":
-                if self._ocr_page_index > 0:
-                    self._ocr_page_index -= 1
-                self._show_current_ocr_page()
-                continue
-
-            if intent == "stop":
-                self._ocr_pages = []
-                self._ocr_page_index = 0
-                self.translation.clear_captions()
-                if self.translation.tts:
-                    self.translation.speak_text(
-                        "Stopped reading.",
-                        timeout_s=self.tts_timeout,
-                        ttl_ms=2000,
-                        show_caption=False,
-                    )
-                return
-
-            if self.translation.tts:
-                self.translation.speak_text(
-                    "Say next page, previous page, or stop reading.",
-                    timeout_s=self.tts_timeout,
-                    ttl_ms=2500,
-                    show_caption=False,
-                )
-                self._show_current_ocr_page()
 
     def _handle_translate_mode(self) -> str | None:
         if self.translation.tts:
@@ -684,7 +567,7 @@ class WakeWordTranslationAssistant:
             if not self._should_exit:
                 self.detector.start()
                 if not self.stay_awake:
-                    threading.Timer(9.2, self._show_idle_wake_caption).start()
+                    threading.Timer(10.0, self._show_idle_wake_caption).start()
 
     def run(self) -> None:
         """Start wake-word listening loop."""

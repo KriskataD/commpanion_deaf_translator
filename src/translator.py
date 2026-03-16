@@ -86,7 +86,7 @@ class TranslatorPipeline:
         self.recorder = AudioRecorder()
         self.stt = self._build_stt_backend(qnn_encoder_dir, qnn_decoder_dir)
         self.translator = MultiLanguageTranslator()
-        self.tts = _TTS() if self.speak else None
+        self.tts = _TTS(preferred_lang=self.target_lang) if self.speak else None
 
         self._captions_overlay_proc = None
         if launch_captions_overlay:
@@ -205,6 +205,8 @@ class TranslatorPipeline:
         """Update the language pair for subsequent translations."""
         self.source_lang = source_lang
         self.target_lang = target_lang
+        if self.tts:
+            self.tts.set_language(target_lang)
 
     def show_caption(
         self,
