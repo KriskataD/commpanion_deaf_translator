@@ -194,7 +194,7 @@ class CaptionOverlayApp:
             anchor="center",
             wraplength=max(200, width - 60),
         )
-        self.label.pack(fill="both", expand=True, padx=24, pady=18)
+        self.label.pack(fill="both", expand=True, padx=24, pady=(6, 24))
 
         # --- Dragging: bind to BOTH root + label (works even if no text)
         self.root.bind("<ButtonPress-1>", self._start_move)

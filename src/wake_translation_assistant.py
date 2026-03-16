@@ -544,7 +544,7 @@ class WakeWordTranslationAssistant:
                         self.translation.speak_text(
                             "Say translate or detect to continue, or say stop listening to finish.",
                             timeout_s=self.tts_timeout,
-                            show_caption=True,
+                            show_caption=False,
                         )
                     continue
 
@@ -561,7 +561,7 @@ class WakeWordTranslationAssistant:
                     self.translation.speak_text(
                         "Say translate or detect to continue, or say stop listening to finish.",
                         timeout_s=self.tts_timeout,
-                        show_caption=True,
+                        show_caption=False,
                     )
         finally:
             if not self._should_exit:

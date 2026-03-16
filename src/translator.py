@@ -245,16 +245,24 @@ class TranslatorPipeline:
     def translate_transcription(self, transcription: str) -> str:
         translated = self.translator.translate(transcription, self.source_lang, self.target_lang)
         if translated:
-            self.speak_text(translated, timeout_s=self.tts_timeout, ttl_ms=9000)
+            self.show_caption(translated, ttl_ms=9000)
+            if self.speak and self.tts:
+                try:
+                    self.tts.start(translated, timeout_s=self.tts_timeout)
+                except Exception as e:
+                    self.logger.warning("TTS failed: %s", e)
         print(f"➡️  Translated ({self.source_lang} → {self.target_lang}): {translated}")
         return translated
 
     def translate_text(self, text: str) -> str:
-        """Translate arbitrary text without invoking the STT step."""
-
         translated = self.translator.translate(text, self.source_lang, self.target_lang)
         if translated:
-            self.speak_text(translated, timeout_s=self.tts_timeout, ttl_ms=9000)
+            self.show_caption(translated, ttl_ms=9000)
+            if self.speak and self.tts:
+                try:
+                    self.tts.start(translated, timeout_s=self.tts_timeout)
+                except Exception as e:
+                    self.logger.warning("TTS failed: %s", e)
         print(f"➡️  Translated text ({self.source_lang} → {self.target_lang}): {translated}")
         return translated
 
