@@ -233,12 +233,25 @@ class WakeWordTranslationAssistant:
                 timeout_s=self.tts_timeout,
                 show_caption=True,
             )
+        cycle = self.translation.performance.start_cycle()
+        transcription = ""
+        translated = ""
         time.sleep(0.1)
+
+        record_start = time.perf_counter()
         audio_path = self.translation.record(filename="last_rec.wav")
+        cycle["record_time_s"] = time.perf_counter() - record_start
         if audio_path:
             self.logger.info("Translation audio captured: %s", audio_path)
         if not audio_path:
             self.logger.warning("No audio captured for translation.")
+            self.translation.performance.complete_cycle(
+                cycle,
+                success=False,
+                error_stage="record",
+                transcription=transcription,
+                translated=translated,
+            )
             if self.translation.tts:
                 self.translation.speak_text(
                     "I did not catch anything to translate. Please try again.",
@@ -248,10 +261,20 @@ class WakeWordTranslationAssistant:
             return None
 
         self.logger.info("Transcribing translation audio...")
+        stt_start = time.perf_counter()
         try:
             transcription = self.translation.transcribe(delete=self.translation.source_lang == "en")
+            cycle["stt_time_s"] = time.perf_counter() - stt_start
         except Exception:
+            cycle["stt_time_s"] = time.perf_counter() - stt_start
             self.logger.exception("Translation transcription failed.")
+            self.translation.performance.complete_cycle(
+                cycle,
+                success=False,
+                error_stage="stt",
+                transcription=transcription,
+                translated=translated,
+            )
             if self.translation.tts:
                 self.translation.speak_text(
                     "I had trouble understanding that. Please try again.",
@@ -260,6 +283,13 @@ class WakeWordTranslationAssistant:
                 )
             return None
         if not transcription or not transcription.strip():
+            self.translation.performance.complete_cycle(
+                cycle,
+                success=False,
+                error_stage="stt",
+                transcription=transcription,
+                translated=translated,
+            )
             if self.translation.source_lang != "en":
                 self.translation.delete_last_audio_file()
             if self.translation.tts:
@@ -294,7 +324,48 @@ class WakeWordTranslationAssistant:
             return stop_intent
 
         self.logger.info("Translating wake word transcription...")
-        self.translation.translate_transcription(transcription)
+        translation_start = time.perf_counter()
+        try:
+            translated = self.translation.translate_transcription(transcription, skip_tts=True)
+            cycle["translation_time_s"] = time.perf_counter() - translation_start
+        except Exception:
+            cycle["translation_time_s"] = time.perf_counter() - translation_start
+            self.logger.exception("Translation failed.")
+            self.translation.performance.complete_cycle(
+                cycle,
+                success=False,
+                error_stage="translate",
+                transcription=transcription,
+                translated=translated,
+            )
+            return None
+
+        if self.translation.speak and self.translation.tts:
+            tts_start = time.perf_counter()
+            try:
+                self.translation.tts.start(translated, timeout_s=self.translation.tts_timeout)
+                cycle["tts_time_s"] = time.perf_counter() - tts_start
+            except Exception:
+                cycle["tts_time_s"] = time.perf_counter() - tts_start
+                self.logger.exception("TTS failed.")
+                self.translation.performance.complete_cycle(
+                    cycle,
+                    success=False,
+                    error_stage="tts",
+                    transcription=transcription,
+                    translated=translated,
+                )
+                return None
+        else:
+            cycle["tts_time_s"] = 0.0
+
+        self.translation.performance.complete_cycle(
+            cycle,
+            success=True,
+            error_stage=None,
+            transcription=transcription,
+            translated=translated,
+        )
         return None
 
     def _handle_detect_mode(self):
@@ -586,7 +657,11 @@ class WakeWordTranslationAssistant:
             self.detector.stop()
             self.detector.cleanup()
             self.translation.recorder.cleanup()
-            # Full program shutdown only
+            self.translation.print_performance_summary()
+            summary_latest, cycles_latest, _, _ = self.translation.save_performance_reports()
+            print("Saved:")
+            print(f"  {summary_latest}")
+            print(f"  {cycles_latest}")
             self.translation.shutdown_captions_overlay()
 
 

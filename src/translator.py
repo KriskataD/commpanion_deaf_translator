@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import csv
+import json
 import logging
 import threading
 import time
 import os
 from pathlib import Path
-from typing import Callable, Optional
+from statistics import mean, pstdev
+from typing import Any, Callable, Optional
 
 import torch
 from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
@@ -25,6 +28,138 @@ from .npu.whisper_qnn_stt import WhisperQnnSTT
 from .recorder import AudioRecorder
 from .tts import _TTS
 from .captions_client import CaptionsClient
+
+try:
+    import psutil
+except Exception:  # pragma: no cover - optional dependency
+    psutil = None
+
+
+class PerformanceTracker:
+    """Collects per-cycle and session-level performance metrics."""
+
+    def __init__(self) -> None:
+        self.session_start_s = time.perf_counter()
+        self.cycles: list[dict[str, Any]] = []
+        self._process = None
+        if psutil is not None:
+            try:
+                self._process = psutil.Process(os.getpid())
+                self._process.cpu_percent(interval=None)
+            except Exception:
+                self._process = None
+
+    def start_cycle(self) -> dict[str, Any]:
+        return {
+            "record_time_s": None,
+            "stt_time_s": None,
+            "translation_time_s": None,
+            "tts_time_s": None,
+            "cycle_total_time_s": None,
+            "input_chars": 0,
+            "output_chars": 0,
+            "input_words": 0,
+            "output_words": 0,
+            "success": False,
+            "error_stage": None,
+            "cpu_percent": None,
+            "rss_memory_mb": None,
+            "_cycle_start_s": time.perf_counter(),
+        }
+
+    @staticmethod
+    def _word_count(text: str) -> int:
+        return len((text or "").split())
+
+    def complete_cycle(
+        self,
+        cycle: dict[str, Any],
+        *,
+        success: bool,
+        error_stage: str | None,
+        transcription: str,
+        translated: str,
+    ) -> dict[str, Any]:
+        cycle["cycle_total_time_s"] = time.perf_counter() - cycle["_cycle_start_s"]
+        cycle["success"] = success
+        cycle["error_stage"] = error_stage
+        cycle["input_chars"] = len((transcription or "").strip())
+        cycle["output_chars"] = len((translated or "").strip())
+        cycle["input_words"] = self._word_count(transcription)
+        cycle["output_words"] = self._word_count(translated)
+        cycle.pop("_cycle_start_s", None)
+        self._snapshot_resources(cycle)
+        self.cycles.append(cycle)
+        return cycle
+
+    def _snapshot_resources(self, cycle: dict[str, Any]) -> None:
+        if self._process is None:
+            return
+        try:
+            cycle["rss_memory_mb"] = self._process.memory_info().rss / (1024 * 1024)
+        except Exception:
+            cycle["rss_memory_mb"] = None
+        try:
+            cycle["cpu_percent"] = self._process.cpu_percent(interval=None)
+        except Exception:
+            cycle["cpu_percent"] = None
+
+    @staticmethod
+    def _numeric_stats(values: list[float]) -> dict[str, float | None]:
+        if not values:
+            return {"avg": None, "min": None, "max": None, "std": None}
+        return {
+            "avg": mean(values),
+            "min": min(values),
+            "max": max(values),
+            "std": pstdev(values) if len(values) > 1 else 0.0,
+        }
+
+    def summary(self) -> dict[str, Any]:
+        total_cycles = len(self.cycles)
+        success_cycles = sum(1 for c in self.cycles if c.get("success"))
+        successful = [c for c in self.cycles if c.get("success")]
+
+        def _vals(key: str) -> list[float]:
+            return [c[key] for c in successful if c.get(key) is not None]
+
+        input_words = [c["input_words"] for c in successful]
+        output_words = [c["output_words"] for c in successful]
+        input_chars = [c["input_chars"] for c in successful]
+        output_chars = [c["output_chars"] for c in successful]
+        rss_values = [c["rss_memory_mb"] for c in self.cycles if c.get("rss_memory_mb") is not None]
+        cpu_values = [c["cpu_percent"] for c in self.cycles if c.get("cpu_percent") is not None]
+
+        session_wall_time_s = max(0.0, time.perf_counter() - self.session_start_s)
+        throughput_per_min = (success_cycles / session_wall_time_s * 60.0) if session_wall_time_s > 0 else 0.0
+
+        return {
+            "session_duration_s": session_wall_time_s,
+            "attempted_cycles": total_cycles,
+            "successful_cycles": success_cycles,
+            "success_rate": (success_cycles / total_cycles) if total_cycles else 0.0,
+            "translations_per_minute": throughput_per_min,
+            "latency_s": {
+                "record_time_s": self._numeric_stats(_vals("record_time_s")),
+                "stt_time_s": self._numeric_stats(_vals("stt_time_s")),
+                "translation_time_s": self._numeric_stats(_vals("translation_time_s")),
+                "tts_time_s": self._numeric_stats(_vals("tts_time_s")),
+                "cycle_total_time_s": self._numeric_stats(_vals("cycle_total_time_s")),
+            },
+            "text_volume": {
+                "avg_input_words": mean(input_words) if input_words else 0.0,
+                "avg_output_words": mean(output_words) if output_words else 0.0,
+                "avg_input_chars": mean(input_chars) if input_chars else 0.0,
+                "avg_output_chars": mean(output_chars) if output_chars else 0.0,
+            },
+            "resources": {
+                "psutil_available": self._process is not None,
+                "avg_rss_memory_mb": mean(rss_values) if rss_values else None,
+                "peak_rss_memory_mb": max(rss_values) if rss_values else None,
+                "avg_cpu_percent": mean(cpu_values) if cpu_values else None,
+            },
+            "cycles": self.cycles,
+        }
 
 class MultiLanguageTranslator:
     """Wrapper around the facebook/m2m100_418M translation model."""
@@ -105,6 +240,7 @@ class TranslatorPipeline:
             self.logger.warning("Captions disabled: %s", e)
             self.captions = None
         self.last_audio_path: Path | None = None
+        self.performance = PerformanceTracker()
 
         self._mic_lock = threading.Lock()
         default_mic = self.recorder.mic_selector.get_default_microphone()
@@ -242,11 +378,11 @@ class TranslatorPipeline:
         if self.speak and self.tts:
             self.tts.start(cleaned, timeout_s=timeout_s)
 
-    def translate_transcription(self, transcription: str) -> str:
+    def translate_transcription(self, transcription: str, *, skip_tts: bool = False) -> str:
         translated = self.translator.translate(transcription, self.source_lang, self.target_lang)
         if translated:
             self.show_caption(translated, ttl_ms=9000)
-            if self.speak and self.tts:
+            if not skip_tts and self.speak and self.tts:
                 try:
                     self.tts.start(translated, timeout_s=self.tts_timeout)
                 except Exception as e:
@@ -268,27 +404,179 @@ class TranslatorPipeline:
 
     def run_once(self) -> str:
         """Record audio once and return the translated text."""
+        cycle = self.performance.start_cycle()
+        transcription = ""
+        translated = ""
+        error_stage: str | None = None
+
+        record_start = time.perf_counter()
         audio_path = self.record()
+        cycle["record_time_s"] = time.perf_counter() - record_start
         if not audio_path:
             print("❌ Failed to capture audio.")
+            self.performance.complete_cycle(
+                cycle,
+                success=False,
+                error_stage="record",
+                transcription=transcription,
+                translated=translated,
+            )
             return ""
 
         print("📝 Transcribing...")
+        stt_start = time.perf_counter()
         try:
             transcription = self.transcribe(language_override=self.source_lang, delete=False)
+            cycle["stt_time_s"] = time.perf_counter() - stt_start
         except Exception as exc:
+            cycle["stt_time_s"] = time.perf_counter() - stt_start
+            error_stage = "stt"
             self.logger.exception("Transcription failed.")
             print(f"❌ Transcription failed: {exc}")
+            self.performance.complete_cycle(
+                cycle,
+                success=False,
+                error_stage=error_stage,
+                transcription=transcription,
+                translated=translated,
+            )
             return ""
         print(f"Original text ({self.source_lang}): {transcription}")
 
         print("🌐 Translating...")
+        translation_start = time.perf_counter()
         try:
-            return self.translate_transcription(transcription)
+            translated = self.translate_transcription(transcription, skip_tts=True)
+            cycle["translation_time_s"] = time.perf_counter() - translation_start
         except Exception as exc:
+            cycle["translation_time_s"] = time.perf_counter() - translation_start
+            error_stage = "translate"
             self.logger.exception("Translation failed.")
             print(f"❌ Translation failed: {exc}")
+            self.performance.complete_cycle(
+                cycle,
+                success=False,
+                error_stage=error_stage,
+                transcription=transcription,
+                translated=translated,
+            )
             return ""
+
+        tts_elapsed = 0.0 if not (self.speak and self.tts) else None
+        if self.speak and self.tts:
+            tts_start = time.perf_counter()
+            try:
+                self.tts.start(translated, timeout_s=self.tts_timeout)
+                tts_elapsed = time.perf_counter() - tts_start
+            except Exception as exc:
+                tts_elapsed = time.perf_counter() - tts_start
+                cycle["tts_time_s"] = tts_elapsed
+                error_stage = "tts"
+                self.logger.warning("TTS failed: %s", exc)
+                self.performance.complete_cycle(
+                    cycle,
+                    success=False,
+                    error_stage=error_stage,
+                    transcription=transcription,
+                    translated=translated,
+                )
+                return translated
+        cycle["tts_time_s"] = tts_elapsed
+        self.performance.complete_cycle(
+            cycle,
+            success=True,
+            error_stage=None,
+            transcription=transcription,
+            translated=translated,
+        )
+        return translated
+
+    @staticmethod
+    def _fmt_stat(value: float | None) -> str:
+        return "N/A" if value is None else f"{value:.2f}"
+
+    def get_performance_summary(self) -> dict[str, Any]:
+        return self.performance.summary()
+
+    def print_performance_summary(self) -> None:
+        summary = self.get_performance_summary()
+        lat = summary["latency_s"]
+        txt = summary["text_volume"]
+        resources = summary["resources"]
+
+        def _line(label: str, stats: dict[str, float | None]) -> str:
+            return (
+                f"  {label:<12} avg={self._fmt_stat(stats['avg'])}  "
+                f"min={self._fmt_stat(stats['min'])}  "
+                f"max={self._fmt_stat(stats['max'])}  "
+                f"std={self._fmt_stat(stats['std'])}"
+            )
+
+        print("\n========== SESSION PERFORMANCE SUMMARY ==========")
+        print(f"Session duration: {summary['session_duration_s']:.2f} s")
+        print(f"Total cycles attempted: {summary['attempted_cycles']}")
+        print(f"Successful cycles: {summary['successful_cycles']}")
+        print(f"Success rate: {summary['success_rate'] * 100:.2f}%")
+        print(f"Translations per minute: {summary['translations_per_minute']:.2f}")
+        print("\nLatency metrics (seconds)")
+        print(_line("Record", lat["record_time_s"]))
+        print(_line("STT", lat["stt_time_s"]))
+        print(_line("Translation", lat["translation_time_s"]))
+        print(_line("TTS", lat["tts_time_s"]))
+        print(_line("Total", lat["cycle_total_time_s"]))
+        print("\nText volume")
+        print(f"  Input words   avg={txt['avg_input_words']:.2f}")
+        print(f"  Output words  avg={txt['avg_output_words']:.2f}")
+        print(f"  Input chars   avg={txt['avg_input_chars']:.2f}")
+        print(f"  Output chars  avg={txt['avg_output_chars']:.2f}")
+        print("\nResources")
+        if resources["psutil_available"]:
+            print(
+                f"  RSS memory MB avg={self._fmt_stat(resources['avg_rss_memory_mb'])}  "
+                f"peak={self._fmt_stat(resources['peak_rss_memory_mb'])}"
+            )
+            print(f"  CPU %         avg={self._fmt_stat(resources['avg_cpu_percent'])}")
+        else:
+            print("  psutil unavailable; resource metrics disabled.")
+
+    def save_performance_reports(self, logs_dir: str | Path = "logs") -> tuple[Path, Path, Path, Path]:
+        summary = self.get_performance_summary()
+        logs_path = Path(logs_dir)
+        logs_path.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+        summary_latest = logs_path / "perf_summary_latest.json"
+        summary_timestamped = logs_path / f"perf_summary_{timestamp}.json"
+        cycles_latest = logs_path / "perf_cycles_latest.csv"
+        cycles_timestamped = logs_path / f"perf_cycles_{timestamp}.csv"
+
+        summary_payload = {k: v for k, v in summary.items() if k != "cycles"}
+        for target in (summary_latest, summary_timestamped):
+            target.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+
+        fields = [
+            "record_time_s",
+            "stt_time_s",
+            "translation_time_s",
+            "tts_time_s",
+            "cycle_total_time_s",
+            "input_chars",
+            "output_chars",
+            "input_words",
+            "output_words",
+            "success",
+            "error_stage",
+            "rss_memory_mb",
+            "cpu_percent",
+        ]
+        for target in (cycles_latest, cycles_timestamped):
+            with target.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                for cycle in self.performance.cycles:
+                    writer.writerow({field: cycle.get(field) for field in fields})
+
+        return summary_latest, cycles_latest, summary_timestamped, cycles_timestamped
 
     def run_loop(self) -> None:
         """Continuously record, translate, and optionally speak until interrupted."""
