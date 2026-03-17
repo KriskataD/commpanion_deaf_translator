@@ -6,7 +6,10 @@ sign language detection.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import math
+import statistics
 import threading
 import time
 from pathlib import Path
@@ -14,6 +17,11 @@ from typing import Callable
 
 from .translator import TranslatorPipeline
 from .wakeword_detector import WakeWordDetector
+
+try:
+    import psutil
+except Exception:  # pragma: no cover - optional dependency
+    psutil = None
 
 
 class WakeWordTranslationAssistant:
@@ -75,6 +83,109 @@ class WakeWordTranslationAssistant:
         self._is_processing = False
         self._should_exit = False
 
+        self._session_start = time.perf_counter()
+        self._attempted_cycles = 0
+        self._successful_cycles = 0
+        self._record_times: list[float] = []
+        self._stt_times: list[float] = []
+        self._translation_times: list[float] = []
+        self._tts_times: list[float] = []
+        self._cycle_times: list[float] = []
+        self._input_words: list[int] = []
+        self._output_words: list[int] = []
+        self._input_chars: list[int] = []
+        self._output_chars: list[int] = []
+        self._rss_samples: list[float] = []
+        self._cpu_samples: list[float] = []
+        self._process = psutil.Process() if psutil else None
+        if self._process:
+            self._process.cpu_percent(interval=None)
+
+    @staticmethod
+    def _stats(values: list[float]) -> dict[str, float | None]:
+        if not values:
+            return {"avg": None, "min": None, "max": None, "std": None}
+        avg = sum(values) / len(values)
+        std = statistics.pstdev(values) if len(values) > 1 else 0.0
+        return {"avg": avg, "min": min(values), "max": max(values), "std": std}
+
+    @staticmethod
+    def _word_count(text: str) -> int:
+        return len([token for token in text.strip().split() if token])
+
+    def _sample_resources(self) -> None:
+        if self._process is None:
+            return
+        rss_mb = self._process.memory_info().rss / (1024 * 1024)
+        cpu_pct = self._process.cpu_percent(interval=None)
+        self._rss_samples.append(rss_mb)
+        self._cpu_samples.append(cpu_pct)
+
+    def _build_metrics(self) -> dict[str, object]:
+        session_duration = time.perf_counter() - self._session_start
+        translations_per_minute = (
+            self._successful_cycles / (session_duration / 60.0)
+            if session_duration > 0
+            else math.nan
+        )
+        return {
+            "session_duration_s": session_duration,
+            "speech_translation": {
+                "mode": "wake_translation_assistant",
+                "attempted_cycles": self._attempted_cycles,
+                "successful_cycles": self._successful_cycles,
+                "success_rate": (
+                    self._successful_cycles / self._attempted_cycles
+                    if self._attempted_cycles
+                    else 0.0
+                ),
+                "translations_per_minute": translations_per_minute,
+                "latency_s": {
+                    "record_time_s": self._stats(self._record_times),
+                    "stt_time_s": self._stats(self._stt_times),
+                    "translation_time_s": self._stats(self._translation_times),
+                    "tts_time_s": self._stats(self._tts_times),
+                    "cycle_total_time_s": self._stats(self._cycle_times),
+                },
+                "text_volume": {
+                    "avg_input_words": (
+                        sum(self._input_words) / len(self._input_words)
+                        if self._input_words
+                        else 0
+                    ),
+                    "avg_output_words": (
+                        sum(self._output_words) / len(self._output_words)
+                        if self._output_words
+                        else 0
+                    ),
+                    "avg_input_chars": (
+                        sum(self._input_chars) / len(self._input_chars)
+                        if self._input_chars
+                        else 0
+                    ),
+                    "avg_output_chars": (
+                        sum(self._output_chars) / len(self._output_chars)
+                        if self._output_chars
+                        else 0
+                    ),
+                },
+                "resources": {
+                    "psutil_available": psutil is not None,
+                    "avg_rss_memory_mb": (
+                        sum(self._rss_samples) / len(self._rss_samples)
+                        if self._rss_samples
+                        else None
+                    ),
+                    "peak_rss_memory_mb": max(self._rss_samples) if self._rss_samples else None,
+                    "avg_cpu_percent": (
+                        sum(self._cpu_samples) / len(self._cpu_samples)
+                        if self._cpu_samples
+                        else None
+                    ),
+                },
+            },
+        }
+
     @staticmethod
     def _get_stop_intent(transcription: str) -> str | None:
         normalized = " ".join(transcription.lower().split())
@@ -99,16 +210,26 @@ class WakeWordTranslationAssistant:
         return None
 
     def _handle_translate_mode(self) -> str | None:
+        cycle_start = time.perf_counter()
+        self._attempted_cycles += 1
+
         if self.translation.tts:
             self.translation.tts.start(
                 "Ready to translate. Please say what you want translated.",
                 timeout_s=self.tts_timeout,
             )
         time.sleep(0.1)
+        record_start = time.perf_counter()
         audio_path = self.translation.record(filename="last_rec.wav")
+        self._record_times.append(time.perf_counter() - record_start)
         if audio_path:
             self.logger.info("Translation audio captured: %s", audio_path)
         if not audio_path:
+            self._stt_times.append(0.0)
+            self._translation_times.append(0.0)
+            self._tts_times.append(0.0)
+            self._cycle_times.append(time.perf_counter() - cycle_start)
+            self._sample_resources()
             self.logger.warning("No audio captured for translation.")
             if self.translation.tts:
                 self.translation.tts.start(
@@ -118,8 +239,14 @@ class WakeWordTranslationAssistant:
             return None
 
         self.logger.info("Transcribing translation audio...")
+        stt_start = time.perf_counter()
         transcription = self.translation.transcribe(delete=self.translation.source_lang == "en")
+        self._stt_times.append(time.perf_counter() - stt_start)
         if not transcription or not transcription.strip():
+            self._translation_times.append(0.0)
+            self._tts_times.append(0.0)
+            self._cycle_times.append(time.perf_counter() - cycle_start)
+            self._sample_resources()
             if self.translation.source_lang != "en":
                 self.translation.stt.delete_last_audio_file()
             if self.translation.tts:
@@ -137,6 +264,10 @@ class WakeWordTranslationAssistant:
                 stop_intent = english_stop_intent
 
         if stop_intent:
+            self._translation_times.append(0.0)
+            self._tts_times.append(0.0)
+            self._cycle_times.append(time.perf_counter() - cycle_start)
+            self._sample_resources()
             if self.translation.tts:
                 if stop_intent == "stop_program":
                     self.translation.tts.start(
@@ -151,7 +282,30 @@ class WakeWordTranslationAssistant:
             return stop_intent
 
         self.logger.info("Translating wake word transcription...")
-        self.translation.translate_transcription(transcription)
+        translation_start = time.perf_counter()
+        translated = self.translation.translator.translate(
+            transcription,
+            self.translation.source_lang,
+            self.translation.target_lang,
+        )
+        self._translation_times.append(time.perf_counter() - translation_start)
+
+        tts_start = time.perf_counter()
+        if self.translation.speak and translated and self.translation.tts:
+            self.translation.tts.start(translated, timeout_s=self.tts_timeout)
+        self._tts_times.append(time.perf_counter() - tts_start)
+
+        self._successful_cycles += 1
+        self._input_words.append(self._word_count(transcription))
+        self._output_words.append(self._word_count(translated))
+        self._input_chars.append(len(transcription))
+        self._output_chars.append(len(translated))
+        self._cycle_times.append(time.perf_counter() - cycle_start)
+        self._sample_resources()
+
+        print(
+            f"➡️  Translated ({self.translation.source_lang} → {self.translation.target_lang}): {translated}"
+        )
         return None
 
     def _with_processing_lock(self, fn: Callable[[], None]) -> None:
@@ -305,6 +459,7 @@ class WakeWordTranslationAssistant:
             self.detector.stop()
             self.detector.cleanup()
             self.translation.recorder.cleanup()
+            print(json.dumps(self._build_metrics(), indent=2))
 
 
 def main() -> None:

@@ -59,6 +59,42 @@ To run the full pipeline:
 python -m src.wake_translation_assistant   --source-lang bg   --target-lang en --stt-model openai_whisper:medium  --wakeword hey_jarvis   --stay-awake   --no-prompt   --tts-timeout 5
 ```
 
+When the process exits (Ctrl+C or stop command), it prints a JSON performance summary to stdout, including `record_time_s`, `stt_time_s`, `translation_time_s`, and `tts_time_s` for translation cycles handled in wake mode.
+
+
+## Performance metrics (translator branch)
+Run a benchmark that outputs JSON metrics in a structure similar to your sample:
+
+```bash
+python -m src.performance_metrics \
+  --mode text_only \
+  --source-lang en \
+  --target-lang fr \
+  --no-speak \
+  --mock-translate \
+  --cycles 3 \
+  --input-text "Hello, this is a benchmark run." \
+  --input-text "Please translate this sentence quickly." \
+  --output metrics/translator_metrics.json
+```
+
+
+To benchmark the full microphone→STT→translation pipeline (real `record_time_s` and `stt_time_s`):
+
+```bash
+python -m src.performance_metrics \
+  --mode full_pipeline \
+  --source-lang en \
+  --target-lang fr \
+  --cycles 1
+```
+
+Notes:
+- This branch does not include the OCR command flow, so the benchmark reports `speech_translation` metrics only.
+- Current benchmark mode is `text_only` (translation path); `record_time_s` and `stt_time_s` are `0.0` in this mode.
+- Use `--mock-translate` when model dependencies are unavailable; this reports mode `text_only_mock` and treats output text as identity-translated input.
+- Install `psutil` to populate memory and CPU metrics (`pip install psutil`).
+
 ## Notes
 - This repo focuses only on STT, translation, TTS, wake word, and YOLOv8 helpers extracted from `commpanion-blind-deaf`. Other intents (OCR, BLIP, collision detection, etc.) are omitted.  
 - The pipeline uses the first available microphone detected by PyAudio; adjust `MicrophoneSelector` or `TranslatorPipeline` if you need a specific device.  
