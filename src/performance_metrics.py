@@ -16,6 +16,9 @@ except Exception:  # pragma: no cover - optional dependency
     psutil = None
 
 
+MODES = ("text_only", "full_pipeline")
+
+
 def _stats(values: list[float]) -> dict[str, float | None]:
     if not values:
         return {"avg": None, "min": None, "max": None, "std": None}
@@ -38,6 +41,7 @@ def _sample_resources(process: Any) -> tuple[float | None, float | None]:
 
 def run_benchmark(
     *,
+    mode: str,
     source_lang: str,
     target_lang: str,
     speak: bool,
@@ -48,12 +52,24 @@ def run_benchmark(
 ) -> dict[str, Any]:
     translator = None
     tts = None
-    if not mock_translate:
-        from .translator import MultiLanguageTranslator
-        from .tts import _TTS
+    pipeline = None
 
-        translator = MultiLanguageTranslator()
-        tts = _TTS() if speak else None
+    if mode == "text_only":
+        if not mock_translate:
+            from .translator import MultiLanguageTranslator
+            from .tts import _TTS
+
+            translator = MultiLanguageTranslator()
+            tts = _TTS() if speak else None
+    else:
+        from .translator import TranslatorPipeline
+
+        pipeline = TranslatorPipeline(
+            source_lang=source_lang,
+            target_lang=target_lang,
+            speak=speak,
+            tts_timeout=tts_timeout,
+        )
 
     process = psutil.Process() if psutil else None
     if process:
@@ -80,21 +96,45 @@ def run_benchmark(
 
     for index in range(cycles):
         cycle_start = time.perf_counter()
+        translated = ""
 
-        # Text-driven benchmark: record/STT not executed on this branch benchmark.
-        record_times.append(0.0)
-        stt_times.append(0.0)
+        if mode == "text_only":
+            record_times.append(0.0)
+            stt_times.append(0.0)
 
-        text = text_inputs[index % len(text_inputs)]
+            text = text_inputs[index % len(text_inputs)]
 
-        translation_start = time.perf_counter()
-        translated = text if mock_translate else translator.translate(text, source_lang, target_lang)
-        translation_times.append(time.perf_counter() - translation_start)
+            translation_start = time.perf_counter()
+            translated = text if mock_translate else translator.translate(text, source_lang, target_lang)
+            translation_times.append(time.perf_counter() - translation_start)
 
-        tts_start = time.perf_counter()
-        if tts and translated:
-            tts.start(translated, timeout_s=tts_timeout)
-        tts_times.append(time.perf_counter() - tts_start)
+            tts_start = time.perf_counter()
+            if tts and translated:
+                tts.start(translated, timeout_s=tts_timeout)
+            tts_times.append(time.perf_counter() - tts_start)
+        else:
+            record_start = time.perf_counter()
+            audio_path = pipeline.record(filename=f"benchmark_{index}.wav")
+            record_times.append(time.perf_counter() - record_start)
+            if not audio_path:
+                stt_times.append(0.0)
+                translation_times.append(0.0)
+                tts_times.append(0.0)
+                cycle_times.append(time.perf_counter() - cycle_start)
+                continue
+
+            stt_start = time.perf_counter()
+            text = pipeline.transcribe()
+            stt_times.append(time.perf_counter() - stt_start)
+
+            translation_start = time.perf_counter()
+            translated = pipeline.translator.translate(text, source_lang, target_lang)
+            translation_times.append(time.perf_counter() - translation_start)
+
+            tts_start = time.perf_counter()
+            if pipeline.speak and translated and pipeline.tts:
+                pipeline.tts.start(translated, timeout_s=tts_timeout)
+            tts_times.append(time.perf_counter() - tts_start)
 
         if translated.strip():
             successful_cycles += 1
@@ -117,10 +157,14 @@ def run_benchmark(
         successful_cycles / (session_duration / 60.0) if session_duration > 0 else math.nan
     )
 
+    effective_mode = mode
+    if mode == "text_only" and mock_translate:
+        effective_mode = "text_only_mock"
+
     return {
         "session_duration_s": session_duration,
         "speech_translation": {
-            "mode": "text_only_mock" if mock_translate else "text_only",
+            "mode": effective_mode,
             "attempted_cycles": attempted_cycles,
             "successful_cycles": successful_cycles,
             "success_rate": (successful_cycles / attempted_cycles) if attempted_cycles else 0.0,
@@ -152,6 +196,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run translator performance metrics and emit JSON output."
     )
+    parser.add_argument("--mode", choices=MODES, default="text_only")
     parser.add_argument("--source-lang", default="en")
     parser.add_argument("--target-lang", default="fr")
     parser.add_argument("--no-speak", action="store_true")
@@ -163,7 +208,11 @@ def main() -> None:
         dest="input_texts",
         help="Input text for text-only benchmark mode. Can be passed multiple times.",
     )
-    parser.add_argument("--mock-translate", action="store_true", help="Use identity translation to benchmark without loading models.")
+    parser.add_argument(
+        "--mock-translate",
+        action="store_true",
+        help="Use identity translation to benchmark without loading models (text_only mode only).",
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -179,6 +228,7 @@ def main() -> None:
     ]
 
     metrics = run_benchmark(
+        mode=args.mode,
         source_lang=args.source_lang,
         target_lang=args.target_lang,
         speak=not args.no_speak,

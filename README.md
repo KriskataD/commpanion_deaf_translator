@@ -65,6 +65,7 @@ Run a benchmark that outputs JSON metrics in a structure similar to your sample:
 
 ```bash
 python -m src.performance_metrics \
+  --mode text_only \
   --source-lang en \
   --target-lang fr \
   --no-speak \
@@ -73,6 +74,17 @@ python -m src.performance_metrics \
   --input-text "Hello, this is a benchmark run." \
   --input-text "Please translate this sentence quickly." \
   --output metrics/translator_metrics.json
+```
+
+
+To benchmark the full microphone→STT→translation pipeline (real `record_time_s` and `stt_time_s`):
+
+```bash
+python -m src.performance_metrics \
+  --mode full_pipeline \
+  --source-lang en \
+  --target-lang fr \
+  --cycles 1
 ```
 
 Notes:
