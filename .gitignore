@@ -6,6 +6,7 @@ __pycache__/
 scripts/
 captured/
 tmp/
+logs/
 # Ignore generated/exported assets
 export_assets/
 
