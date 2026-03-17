@@ -59,6 +59,8 @@ To run the full pipeline:
 python -m src.wake_translation_assistant   --source-lang bg   --target-lang en --stt-model openai_whisper:medium  --wakeword hey_jarvis   --stay-awake   --no-prompt   --tts-timeout 5
 ```
 
+When the process exits (Ctrl+C or stop command), it prints a JSON performance summary to stdout, including `record_time_s`, `stt_time_s`, `translation_time_s`, and `tts_time_s` for translation cycles handled in wake mode.
+
 
 ## Performance metrics (translator branch)
 Run a benchmark that outputs JSON metrics in a structure similar to your sample:
