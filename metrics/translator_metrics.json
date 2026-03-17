@@ -1,11 +1,11 @@
 {
-  "session_duration_s": 3.180600015184609e-05,
+  "session_duration_s": 0.0009679000067990273,
   "speech_translation": {
     "mode": "text_only_mock",
     "attempted_cycles": 3,
     "successful_cycles": 3,
     "success_rate": 1.0,
-    "translations_per_minute": 5659309.537214864,
+    "translations_per_minute": 185969.62365491007,
     "latency_s": {
       "record_time_s": {
         "avg": 0.0,
@@ -20,35 +20,35 @@
         "std": 0.0
       },
       "translation_time_s": {
-        "avg": 2.7133349552362535e-07,
-        "min": 2.0900006347801536e-07,
-        "max": 3.330001163703855e-07,
-        "std": 5.0625005397259514e-08
+        "avg": 3.3333102085938055e-07,
+        "min": 2.00001522898674e-07,
+        "max": 4.00003045797348e-07,
+        "std": 9.427819232738856e-08
       },
       "tts_time_s": {
-        "avg": 2.6566673720177886e-07,
-        "min": 1.9700019038282335e-07,
-        "max": 3.8899997889529914e-07,
-        "std": 8.739685480073232e-08
+        "avg": 3.6666460800915956e-07,
+        "min": 2.9998773243278265e-07,
+        "max": 4.00003045797348e-07,
+        "std": 4.7147670868387806e-08
       },
       "cycle_total_time_s": {
-        "avg": 8.807333415461471e-06,
-        "min": 4.837000233237632e-06,
-        "max": 1.5885999800957507e-05,
-        "std": 5.017728525856548e-06
+        "avg": 0.0003213333305514728,
+        "min": 2.5600005756132305e-05,
+        "max": 0.0009012999944388866,
+        "std": 0.000410125233583854
       }
     },
     "text_volume": {
-      "avg_input_words": 6.0,
-      "avg_output_words": 6.0,
-      "avg_input_chars": 42.333333333333336,
-      "avg_output_chars": 42.333333333333336
+      "avg_input_words": 18.0,
+      "avg_output_words": 18.0,
+      "avg_input_chars": 110.0,
+      "avg_output_chars": 110.0
     },
     "resources": {
-      "psutil_available": false,
-      "avg_rss_memory_mb": null,
-      "peak_rss_memory_mb": null,
-      "avg_cpu_percent": null
+      "psutil_available": true,
+      "avg_rss_memory_mb": 30.345052083333332,
+      "peak_rss_memory_mb": 30.34765625,
+      "avg_cpu_percent": 0.0
     }
   }
 }

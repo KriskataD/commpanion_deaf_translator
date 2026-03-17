@@ -4,6 +4,12 @@ src/models/*.bin
 __pycache__/
 *.pyc
 
+metrics/
+captured/
+logs/
+scripts/
+tmp/
+
 # Ignore generated/exported assets
 export_assets/
 
