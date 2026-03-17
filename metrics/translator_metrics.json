@@ -1,0 +1,54 @@
+{
+  "session_duration_s": 6.528199992317241e-05,
+  "speech_translation": {
+    "mode": "text_only_mock",
+    "attempted_cycles": 3,
+    "successful_cycles": 3,
+    "success_rate": 1.0,
+    "translations_per_minute": 2757268.4692845545,
+    "latency_s": {
+      "record_time_s": {
+        "avg": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "std": 0.0
+      },
+      "stt_time_s": {
+        "avg": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "std": 0.0
+      },
+      "translation_time_s": {
+        "avg": 5.006665257193769e-07,
+        "min": 4.069988790433854e-07,
+        "max": 5.55000951862894e-07,
+        "std": 6.651556242870277e-08
+      },
+      "tts_time_s": {
+        "avg": 4.5266703333860886e-07,
+        "min": 3.910008672391996e-07,
+        "max": 5.59999534743838e-07,
+        "std": 7.617610316358411e-08
+      },
+      "cycle_total_time_s": {
+        "avg": 1.797499983998326e-05,
+        "min": 9.051000233739614e-06,
+        "max": 3.334900065965485e-05,
+        "std": 1.0917878087930234e-05
+      }
+    },
+    "text_volume": {
+      "avg_input_words": 6.0,
+      "avg_output_words": 6.0,
+      "avg_input_chars": 42.333333333333336,
+      "avg_output_chars": 42.333333333333336
+    },
+    "resources": {
+      "psutil_available": false,
+      "avg_rss_memory_mb": null,
+      "peak_rss_memory_mb": null,
+      "avg_cpu_percent": null
+    }
+  }
+}
