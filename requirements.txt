@@ -20,3 +20,6 @@ comtypes
 ultralytics
 opencv-python
 lmstudio
+
+# Optional performance metrics
+psutil

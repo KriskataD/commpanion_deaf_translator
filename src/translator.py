@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import csv
+import json
 import logging
 import threading
 import time
 import os
 from pathlib import Path
-from typing import Callable, Optional
+from statistics import mean, pstdev
+from typing import Any, Callable, Optional
 
 import torch
 from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
@@ -25,6 +28,254 @@ from .npu.whisper_qnn_stt import WhisperQnnSTT
 from .recorder import AudioRecorder
 from .tts import _TTS
 from .captions_client import CaptionsClient
+
+try:
+    import psutil
+except Exception:  # pragma: no cover - optional dependency
+    psutil = None
+
+
+class PerformanceTracker:
+    """Collects speech-translation and OCR performance metrics."""
+
+    def __init__(self) -> None:
+        self.session_start_s = time.perf_counter()
+        self.speech_cycles: list[dict[str, Any]] = []
+        self.ocr_cycles: list[dict[str, Any]] = []
+        self.ocr_command_record_samples: list[float] = []
+        self.ocr_command_stt_samples: list[float] = []
+        self._process = None
+        if psutil is not None:
+            try:
+                self._process = psutil.Process(os.getpid())
+                self._process.cpu_percent(interval=None)
+            except Exception:
+                self._process = None
+
+    @staticmethod
+    def _word_count(text: str) -> int:
+        return len((text or "").split())
+
+    @staticmethod
+    def _numeric_stats(values: list[float]) -> dict[str, float | None]:
+        if not values:
+            return {"avg": None, "min": None, "max": None, "std": None}
+        return {
+            "avg": mean(values),
+            "min": min(values),
+            "max": max(values),
+            "std": pstdev(values) if len(values) > 1 else 0.0,
+        }
+
+    def _snapshot_resources(self, cycle: dict[str, Any]) -> None:
+        if self._process is None:
+            return
+        try:
+            cycle["rss_memory_mb"] = self._process.memory_info().rss / (1024 * 1024)
+        except Exception:
+            cycle["rss_memory_mb"] = None
+        try:
+            cycle["cpu_percent"] = self._process.cpu_percent(interval=None)
+        except Exception:
+            cycle["cpu_percent"] = None
+
+    def start_speech_cycle(self) -> dict[str, Any]:
+        return {
+            "mode": "speech_translation",
+            "record_time_s": None,
+            "stt_time_s": None,
+            "translation_time_s": None,
+            "tts_time_s": None,
+            "cycle_total_time_s": None,
+            "input_chars": 0,
+            "output_chars": 0,
+            "input_words": 0,
+            "output_words": 0,
+            "success": False,
+            "error_stage": None,
+            "cpu_percent": None,
+            "rss_memory_mb": None,
+            "_cycle_start_s": time.perf_counter(),
+        }
+
+    def complete_speech_cycle(
+        self,
+        cycle: dict[str, Any],
+        *,
+        success: bool,
+        error_stage: str | None,
+        transcription: str,
+        translated: str,
+    ) -> None:
+        cycle["cycle_total_time_s"] = time.perf_counter() - cycle["_cycle_start_s"]
+        cycle["success"] = success
+        cycle["error_stage"] = error_stage
+        cycle["input_chars"] = len((transcription or "").strip())
+        cycle["output_chars"] = len((translated or "").strip())
+        cycle["input_words"] = self._word_count(transcription)
+        cycle["output_words"] = self._word_count(translated)
+        cycle.pop("_cycle_start_s", None)
+        self._snapshot_resources(cycle)
+        self.speech_cycles.append(cycle)
+
+    def start_ocr_cycle(self) -> dict[str, Any]:
+        return {
+            "mode": "ocr_detect",
+            "ocr_scan_time_s": None,
+            "ocr_total_time_s": None,
+            "ocr_text_found": False,
+            "ocr_chars": 0,
+            "ocr_words": 0,
+            "ocr_pages": 0,
+            "ocr_translated": False,
+            "ocr_translate_time_s": None,
+            "ocr_translated_chars": 0,
+            "ocr_translated_words": 0,
+            "ocr_command_cycles": 0,
+            "ocr_command_record_time_s": None,
+            "ocr_command_stt_time_s": None,
+            "ocr_next_count": 0,
+            "ocr_previous_count": 0,
+            "ocr_translate_count": 0,
+            "ocr_stop_count": 0,
+            "ocr_unknown_count": 0,
+            "success": False,
+            "error_stage": None,
+            "cpu_percent": None,
+            "rss_memory_mb": None,
+            "_ocr_start_s": time.perf_counter(),
+            "_ocr_command_record_samples": [],
+            "_ocr_command_stt_samples": [],
+        }
+
+    def record_ocr_translation(self, cycle: dict[str, Any], translated_text: str, elapsed_s: float) -> None:
+        cycle["ocr_translated"] = bool((translated_text or "").strip())
+        cycle["ocr_translate_time_s"] = elapsed_s
+        cycle["ocr_translated_chars"] = len((translated_text or "").strip())
+        cycle["ocr_translated_words"] = self._word_count(translated_text)
+
+    def record_ocr_command(
+        self,
+        cycle: dict[str, Any],
+        *,
+        record_time_s: float | None,
+        stt_time_s: float | None,
+        intent: str | None,
+    ) -> None:
+        cycle["ocr_command_cycles"] += 1
+        if record_time_s is not None:
+            self.ocr_command_record_samples.append(record_time_s)
+            cycle["_ocr_command_record_samples"].append(record_time_s)
+        if stt_time_s is not None:
+            self.ocr_command_stt_samples.append(stt_time_s)
+            cycle["_ocr_command_stt_samples"].append(stt_time_s)
+
+        intent_key = {
+            "next": "ocr_next_count",
+            "previous": "ocr_previous_count",
+            "translate": "ocr_translate_count",
+            "stop": "ocr_stop_count",
+        }.get(intent, "ocr_unknown_count")
+        cycle[intent_key] += 1
+
+    def complete_ocr_cycle(self, cycle: dict[str, Any], *, success: bool, error_stage: str | None) -> None:
+        cycle["ocr_total_time_s"] = time.perf_counter() - cycle["_ocr_start_s"]
+        cycle["success"] = success
+        cycle["error_stage"] = error_stage
+
+        record_samples = cycle.pop("_ocr_command_record_samples", [])
+        stt_samples = cycle.pop("_ocr_command_stt_samples", [])
+        cycle["ocr_command_record_time_s"] = mean(record_samples) if record_samples else None
+        cycle["ocr_command_stt_time_s"] = mean(stt_samples) if stt_samples else None
+        cycle.pop("_ocr_start_s", None)
+
+        self._snapshot_resources(cycle)
+        self.ocr_cycles.append(cycle)
+
+    def summary(self) -> dict[str, Any]:
+        session_wall_time_s = max(0.0, time.perf_counter() - self.session_start_s)
+
+        speech_attempted = len(self.speech_cycles)
+        speech_success = sum(1 for c in self.speech_cycles if c.get("success"))
+        speech_successful = [c for c in self.speech_cycles if c.get("success")]
+
+        def _speech_vals(key: str) -> list[float]:
+            return [c[key] for c in speech_successful if c.get(key) is not None]
+
+        speech_rss = [c["rss_memory_mb"] for c in self.speech_cycles if c.get("rss_memory_mb") is not None]
+        speech_cpu = [c["cpu_percent"] for c in self.speech_cycles if c.get("cpu_percent") is not None]
+
+        ocr_attempted = len(self.ocr_cycles)
+        ocr_success = sum(1 for c in self.ocr_cycles if c.get("success"))
+        ocr_with_text = [c for c in self.ocr_cycles if c.get("ocr_text_found")]
+
+        def _ocr_vals(key: str) -> list[float]:
+            return [c[key] for c in self.ocr_cycles if c.get(key) is not None]
+
+        ocr_rss = [c["rss_memory_mb"] for c in self.ocr_cycles if c.get("rss_memory_mb") is not None]
+        ocr_cpu = [c["cpu_percent"] for c in self.ocr_cycles if c.get("cpu_percent") is not None]
+
+        return {
+            "session_duration_s": session_wall_time_s,
+            "speech_translation": {
+                "attempted_cycles": speech_attempted,
+                "successful_cycles": speech_success,
+                "success_rate": (speech_success / speech_attempted) if speech_attempted else 0.0,
+                "translations_per_minute": (speech_success / session_wall_time_s * 60.0) if session_wall_time_s > 0 else 0.0,
+                "latency_s": {
+                    "record_time_s": self._numeric_stats(_speech_vals("record_time_s")),
+                    "stt_time_s": self._numeric_stats(_speech_vals("stt_time_s")),
+                    "translation_time_s": self._numeric_stats(_speech_vals("translation_time_s")),
+                    "tts_time_s": self._numeric_stats(_speech_vals("tts_time_s")),
+                    "cycle_total_time_s": self._numeric_stats(_speech_vals("cycle_total_time_s")),
+                },
+                "text_volume": {
+                    "avg_input_words": mean([c["input_words"] for c in speech_successful]) if speech_successful else 0.0,
+                    "avg_output_words": mean([c["output_words"] for c in speech_successful]) if speech_successful else 0.0,
+                    "avg_input_chars": mean([c["input_chars"] for c in speech_successful]) if speech_successful else 0.0,
+                    "avg_output_chars": mean([c["output_chars"] for c in speech_successful]) if speech_successful else 0.0,
+                },
+                "resources": {
+                    "psutil_available": self._process is not None,
+                    "avg_rss_memory_mb": mean(speech_rss) if speech_rss else None,
+                    "peak_rss_memory_mb": max(speech_rss) if speech_rss else None,
+                    "avg_cpu_percent": mean(speech_cpu) if speech_cpu else None,
+                },
+            },
+            "ocr_detect": {
+                "scan_attempts": ocr_attempted,
+                "successful_scans": ocr_success,
+                "success_rate": (ocr_success / ocr_attempted) if ocr_attempted else 0.0,
+                "latency_s": {
+                    "ocr_scan_time_s": self._numeric_stats(_ocr_vals("ocr_scan_time_s")),
+                    "ocr_total_time_s": self._numeric_stats(_ocr_vals("ocr_total_time_s")),
+                    "ocr_translate_time_s": self._numeric_stats(_ocr_vals("ocr_translate_time_s")),
+                    "ocr_command_record_time_s": self._numeric_stats(self.ocr_command_record_samples),
+                    "ocr_command_stt_time_s": self._numeric_stats(self.ocr_command_stt_samples),
+                },
+                "text_volume": {
+                    "avg_ocr_words": mean([c["ocr_words"] for c in ocr_with_text]) if ocr_with_text else 0.0,
+                    "avg_ocr_chars": mean([c["ocr_chars"] for c in ocr_with_text]) if ocr_with_text else 0.0,
+                    "avg_ocr_pages": mean([c["ocr_pages"] for c in ocr_with_text]) if ocr_with_text else 0.0,
+                },
+                "commands": {
+                    "total_commands": sum(c.get("ocr_command_cycles", 0) for c in self.ocr_cycles),
+                    "ocr_next_count": sum(c.get("ocr_next_count", 0) for c in self.ocr_cycles),
+                    "ocr_previous_count": sum(c.get("ocr_previous_count", 0) for c in self.ocr_cycles),
+                    "ocr_translate_count": sum(c.get("ocr_translate_count", 0) for c in self.ocr_cycles),
+                    "ocr_stop_count": sum(c.get("ocr_stop_count", 0) for c in self.ocr_cycles),
+                    "ocr_unknown_count": sum(c.get("ocr_unknown_count", 0) for c in self.ocr_cycles),
+                },
+                "resources": {
+                    "psutil_available": self._process is not None,
+                    "avg_rss_memory_mb": mean(ocr_rss) if ocr_rss else None,
+                    "peak_rss_memory_mb": max(ocr_rss) if ocr_rss else None,
+                    "avg_cpu_percent": mean(ocr_cpu) if ocr_cpu else None,
+                },
+            },
+            "speech_cycles": self.speech_cycles,
+            "ocr_cycles": self.ocr_cycles,
+        }
 
 class MultiLanguageTranslator:
     """Wrapper around the facebook/m2m100_418M translation model."""
@@ -105,6 +356,7 @@ class TranslatorPipeline:
             self.logger.warning("Captions disabled: %s", e)
             self.captions = None
         self.last_audio_path: Path | None = None
+        self.performance = PerformanceTracker()
 
         self._mic_lock = threading.Lock()
         default_mic = self.recorder.mic_selector.get_default_microphone()
@@ -242,11 +494,11 @@ class TranslatorPipeline:
         if self.speak and self.tts:
             self.tts.start(cleaned, timeout_s=timeout_s)
 
-    def translate_transcription(self, transcription: str) -> str:
+    def translate_transcription(self, transcription: str, *, skip_tts: bool = False) -> str:
         translated = self.translator.translate(transcription, self.source_lang, self.target_lang)
         if translated:
             self.show_caption(translated, ttl_ms=9000)
-            if self.speak and self.tts:
+            if not skip_tts and self.speak and self.tts:
                 try:
                     self.tts.start(translated, timeout_s=self.tts_timeout)
                 except Exception as e:
@@ -268,27 +520,259 @@ class TranslatorPipeline:
 
     def run_once(self) -> str:
         """Record audio once and return the translated text."""
+        cycle = self.performance.start_speech_cycle()
+        transcription = ""
+        translated = ""
+        error_stage: str | None = None
+
+        record_start = time.perf_counter()
         audio_path = self.record()
+        cycle["record_time_s"] = time.perf_counter() - record_start
         if not audio_path:
             print("❌ Failed to capture audio.")
+            self.performance.complete_speech_cycle(
+                cycle,
+                success=False,
+                error_stage="record",
+                transcription=transcription,
+                translated=translated,
+            )
             return ""
 
         print("📝 Transcribing...")
+        stt_start = time.perf_counter()
         try:
             transcription = self.transcribe(language_override=self.source_lang, delete=False)
+            cycle["stt_time_s"] = time.perf_counter() - stt_start
         except Exception as exc:
+            cycle["stt_time_s"] = time.perf_counter() - stt_start
+            error_stage = "stt"
             self.logger.exception("Transcription failed.")
             print(f"❌ Transcription failed: {exc}")
+            self.performance.complete_speech_cycle(
+                cycle,
+                success=False,
+                error_stage=error_stage,
+                transcription=transcription,
+                translated=translated,
+            )
             return ""
         print(f"Original text ({self.source_lang}): {transcription}")
 
         print("🌐 Translating...")
+        translation_start = time.perf_counter()
         try:
-            return self.translate_transcription(transcription)
+            translated = self.translate_transcription(transcription, skip_tts=True)
+            cycle["translation_time_s"] = time.perf_counter() - translation_start
         except Exception as exc:
+            cycle["translation_time_s"] = time.perf_counter() - translation_start
+            error_stage = "translate"
             self.logger.exception("Translation failed.")
             print(f"❌ Translation failed: {exc}")
+            self.performance.complete_speech_cycle(
+                cycle,
+                success=False,
+                error_stage=error_stage,
+                transcription=transcription,
+                translated=translated,
+            )
             return ""
+
+        tts_elapsed = 0.0 if not (self.speak and self.tts) else None
+        if self.speak and self.tts:
+            tts_start = time.perf_counter()
+            try:
+                self.tts.start(translated, timeout_s=self.tts_timeout)
+                tts_elapsed = time.perf_counter() - tts_start
+            except Exception as exc:
+                tts_elapsed = time.perf_counter() - tts_start
+                cycle["tts_time_s"] = tts_elapsed
+                error_stage = "tts"
+                self.logger.warning("TTS failed: %s", exc)
+                self.performance.complete_speech_cycle(
+                    cycle,
+                    success=False,
+                    error_stage=error_stage,
+                    transcription=transcription,
+                    translated=translated,
+                )
+                return translated
+        cycle["tts_time_s"] = tts_elapsed
+        self.performance.complete_speech_cycle(
+            cycle,
+            success=True,
+            error_stage=None,
+            transcription=transcription,
+            translated=translated,
+        )
+        return translated
+
+    @staticmethod
+    def _fmt_stat(value: float | None) -> str:
+        return "N/A" if value is None else f"{value:.2f}"
+
+    def get_performance_summary(self) -> dict[str, Any]:
+        return self.performance.summary()
+
+    def print_performance_summary(self) -> None:
+        summary = self.get_performance_summary()
+        speech = summary["speech_translation"]
+        ocr = summary["ocr_detect"]
+
+        def _line(label: str, stats: dict[str, float | None]) -> str:
+            return (
+                f"  {label:<12} avg={self._fmt_stat(stats['avg'])}  "
+                f"min={self._fmt_stat(stats['min'])}  "
+                f"max={self._fmt_stat(stats['max'])}  "
+                f"std={self._fmt_stat(stats['std'])}"
+            )
+
+        print("\n========== SESSION PERFORMANCE SUMMARY ==========")
+        print(f"Session duration: {summary['session_duration_s']:.2f} s")
+        print(f"Total cycles attempted: {speech['attempted_cycles']}")
+        print(f"Successful cycles: {speech['successful_cycles']}")
+        print(f"Success rate: {speech['success_rate'] * 100:.2f}%")
+        print(f"Translations per minute: {speech['translations_per_minute']:.2f}")
+        print("\nLatency metrics (seconds)")
+        print(_line("Record", speech["latency_s"]["record_time_s"]))
+        print(_line("STT", speech["latency_s"]["stt_time_s"]))
+        print(_line("Translation", speech["latency_s"]["translation_time_s"]))
+        print(_line("TTS", speech["latency_s"]["tts_time_s"]))
+        print(_line("Total", speech["latency_s"]["cycle_total_time_s"]))
+        print("\nText volume")
+        print(f"  Input words   avg={speech['text_volume']['avg_input_words']:.2f}")
+        print(f"  Output words  avg={speech['text_volume']['avg_output_words']:.2f}")
+        print(f"  Input chars   avg={speech['text_volume']['avg_input_chars']:.2f}")
+        print(f"  Output chars  avg={speech['text_volume']['avg_output_chars']:.2f}")
+        print("\nResources")
+        if speech["resources"]["psutil_available"]:
+            print(
+                f"  RSS memory MB avg={self._fmt_stat(speech['resources']['avg_rss_memory_mb'])}  "
+                f"peak={self._fmt_stat(speech['resources']['peak_rss_memory_mb'])}"
+            )
+            print(f"  CPU %         avg={self._fmt_stat(speech['resources']['avg_cpu_percent'])}")
+        else:
+            print("  psutil unavailable; resource metrics disabled.")
+
+        print("\n========== OCR / DETECT MODE SUMMARY ==========")
+        print(f"OCR scan attempts: {ocr['scan_attempts']}")
+        print(f"Successful OCR scans: {ocr['successful_scans']}")
+        print(f"OCR success rate: {ocr['success_rate'] * 100:.2f}%")
+        print("\nOCR latency metrics (seconds)")
+        print(_line("Scan", ocr["latency_s"]["ocr_scan_time_s"]))
+        print(_line("Detect total", ocr["latency_s"]["ocr_total_time_s"]))
+        print(_line("OCR translate", ocr["latency_s"]["ocr_translate_time_s"]))
+        print("\nOCR text volume")
+        print(f"  OCR words     avg={ocr['text_volume']['avg_ocr_words']:.2f}")
+        print(f"  OCR chars     avg={ocr['text_volume']['avg_ocr_chars']:.2f}")
+        print(f"  OCR pages     avg={ocr['text_volume']['avg_ocr_pages']:.2f}")
+        print("\nOCR voice commands")
+        print(f"  Commands total: {ocr['commands']['total_commands']}")
+        print(_line("Record", ocr["latency_s"]["ocr_command_record_time_s"]))
+        print(_line("STT", ocr["latency_s"]["ocr_command_stt_time_s"]))
+        print(
+            "  "
+            f"next={ocr['commands']['ocr_next_count']}  "
+            f"previous={ocr['commands']['ocr_previous_count']}  "
+            f"translate={ocr['commands']['ocr_translate_count']}  "
+            f"stop={ocr['commands']['ocr_stop_count']}  "
+            f"unknown={ocr['commands']['ocr_unknown_count']}"
+        )
+        if ocr["resources"]["psutil_available"]:
+            print(
+                f"  OCR RSS MB    avg={self._fmt_stat(ocr['resources']['avg_rss_memory_mb'])}  "
+                f"peak={self._fmt_stat(ocr['resources']['peak_rss_memory_mb'])}"
+            )
+            print(f"  OCR CPU %     avg={self._fmt_stat(ocr['resources']['avg_cpu_percent'])}")
+        print("===============================================")
+
+    def save_performance_reports(
+        self,
+        logs_dir: str | Path = "logs",
+    ) -> tuple[Path, Path, Path, Path, Path, Path]:
+        summary = self.get_performance_summary()
+        logs_path = Path(logs_dir)
+        logs_path.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+        summary_latest = logs_path / "perf_summary_latest.json"
+        summary_timestamped = logs_path / f"perf_summary_{timestamp}.json"
+        speech_latest = logs_path / "perf_cycles_latest.csv"
+        speech_timestamped = logs_path / f"perf_cycles_{timestamp}.csv"
+        ocr_latest = logs_path / "perf_ocr_cycles_latest.csv"
+        ocr_timestamped = logs_path / f"perf_ocr_cycles_{timestamp}.csv"
+
+        summary_payload = {
+            "session_duration_s": summary["session_duration_s"],
+            "speech_translation": summary["speech_translation"],
+            "ocr_detect": summary["ocr_detect"],
+        }
+        for target in (summary_latest, summary_timestamped):
+            target.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+
+        speech_fields = [
+            "mode",
+            "record_time_s",
+            "stt_time_s",
+            "translation_time_s",
+            "tts_time_s",
+            "cycle_total_time_s",
+            "input_chars",
+            "output_chars",
+            "input_words",
+            "output_words",
+            "success",
+            "error_stage",
+            "rss_memory_mb",
+            "cpu_percent",
+        ]
+        for target in (speech_latest, speech_timestamped):
+            with target.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=speech_fields)
+                writer.writeheader()
+                for cycle in self.performance.speech_cycles:
+                    writer.writerow({field: cycle.get(field) for field in speech_fields})
+
+        ocr_fields = [
+            "mode",
+            "ocr_scan_time_s",
+            "ocr_total_time_s",
+            "ocr_text_found",
+            "ocr_chars",
+            "ocr_words",
+            "ocr_pages",
+            "ocr_translated",
+            "ocr_translate_time_s",
+            "ocr_translated_chars",
+            "ocr_translated_words",
+            "ocr_command_cycles",
+            "ocr_command_record_time_s",
+            "ocr_command_stt_time_s",
+            "ocr_next_count",
+            "ocr_previous_count",
+            "ocr_translate_count",
+            "ocr_stop_count",
+            "ocr_unknown_count",
+            "success",
+            "error_stage",
+            "rss_memory_mb",
+            "cpu_percent",
+        ]
+        for target in (ocr_latest, ocr_timestamped):
+            with target.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=ocr_fields)
+                writer.writeheader()
+                for cycle in self.performance.ocr_cycles:
+                    writer.writerow({field: cycle.get(field) for field in ocr_fields})
+
+        return (
+            summary_latest,
+            speech_latest,
+            ocr_latest,
+            summary_timestamped,
+            speech_timestamped,
+            ocr_timestamped,
+        )
 
     def run_loop(self) -> None:
         """Continuously record, translate, and optionally speak until interrupted."""

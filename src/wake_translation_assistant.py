@@ -202,15 +202,27 @@ class WakeWordTranslationAssistant:
         )
 
 
-    def _translate_ocr_text(self) -> None:
+    def _translate_ocr_text(self, ocr_cycle: dict[str, object] | None = None) -> None:
         if not self._ocr_original_text.strip():
             return
 
-        translated = self.translation.translator.translate(
-            self._ocr_original_text,
-            source_lang="en",   # keep your current OCR demo assumption
-            target_lang=self.translation.target_lang,
-        )
+        translate_start = time.perf_counter()
+        try:
+            translated = self.translation.translator.translate(
+                self._ocr_original_text,
+                source_lang="en",   # keep your current OCR demo assumption
+                target_lang=self.translation.target_lang,
+            )
+            elapsed = time.perf_counter() - translate_start
+        except Exception:
+            elapsed = time.perf_counter() - translate_start
+            if ocr_cycle is not None:
+                ocr_cycle["error_stage"] = "ocr_translate"
+                self.translation.performance.record_ocr_translation(ocr_cycle, "", elapsed)
+            raise
+
+        if ocr_cycle is not None:
+            self.translation.performance.record_ocr_translation(ocr_cycle, translated, elapsed)
 
         if not translated or not translated.strip():
             if self.translation.tts:
@@ -233,12 +245,25 @@ class WakeWordTranslationAssistant:
                 timeout_s=self.tts_timeout,
                 show_caption=True,
             )
+        cycle = self.translation.performance.start_speech_cycle()
+        transcription = ""
+        translated = ""
         time.sleep(0.1)
+
+        record_start = time.perf_counter()
         audio_path = self.translation.record(filename="last_rec.wav")
+        cycle["record_time_s"] = time.perf_counter() - record_start
         if audio_path:
             self.logger.info("Translation audio captured: %s", audio_path)
         if not audio_path:
             self.logger.warning("No audio captured for translation.")
+            self.translation.performance.complete_speech_cycle(
+                cycle,
+                success=False,
+                error_stage="record",
+                transcription=transcription,
+                translated=translated,
+            )
             if self.translation.tts:
                 self.translation.speak_text(
                     "I did not catch anything to translate. Please try again.",
@@ -248,10 +273,20 @@ class WakeWordTranslationAssistant:
             return None
 
         self.logger.info("Transcribing translation audio...")
+        stt_start = time.perf_counter()
         try:
             transcription = self.translation.transcribe(delete=self.translation.source_lang == "en")
+            cycle["stt_time_s"] = time.perf_counter() - stt_start
         except Exception:
+            cycle["stt_time_s"] = time.perf_counter() - stt_start
             self.logger.exception("Translation transcription failed.")
+            self.translation.performance.complete_speech_cycle(
+                cycle,
+                success=False,
+                error_stage="stt",
+                transcription=transcription,
+                translated=translated,
+            )
             if self.translation.tts:
                 self.translation.speak_text(
                     "I had trouble understanding that. Please try again.",
@@ -260,6 +295,13 @@ class WakeWordTranslationAssistant:
                 )
             return None
         if not transcription or not transcription.strip():
+            self.translation.performance.complete_speech_cycle(
+                cycle,
+                success=False,
+                error_stage="stt",
+                transcription=transcription,
+                translated=translated,
+            )
             if self.translation.source_lang != "en":
                 self.translation.delete_last_audio_file()
             if self.translation.tts:
@@ -294,24 +336,79 @@ class WakeWordTranslationAssistant:
             return stop_intent
 
         self.logger.info("Translating wake word transcription...")
-        self.translation.translate_transcription(transcription)
+        translation_start = time.perf_counter()
+        try:
+            translated = self.translation.translate_transcription(transcription, skip_tts=True)
+            cycle["translation_time_s"] = time.perf_counter() - translation_start
+        except Exception:
+            cycle["translation_time_s"] = time.perf_counter() - translation_start
+            self.logger.exception("Translation failed.")
+            self.translation.performance.complete_speech_cycle(
+                cycle,
+                success=False,
+                error_stage="translate",
+                transcription=transcription,
+                translated=translated,
+            )
+            return None
+
+        if self.translation.speak and self.translation.tts:
+            tts_start = time.perf_counter()
+            try:
+                self.translation.tts.start(translated, timeout_s=self.translation.tts_timeout)
+                cycle["tts_time_s"] = time.perf_counter() - tts_start
+            except Exception:
+                cycle["tts_time_s"] = time.perf_counter() - tts_start
+                self.logger.exception("TTS failed.")
+                self.translation.performance.complete_speech_cycle(
+                    cycle,
+                    success=False,
+                    error_stage="tts",
+                    transcription=transcription,
+                    translated=translated,
+                )
+                return None
+        else:
+            cycle["tts_time_s"] = 0.0
+
+        self.translation.performance.complete_speech_cycle(
+            cycle,
+            success=True,
+            error_stage=None,
+            transcription=transcription,
+            translated=translated,
+        )
         return None
 
     def _handle_detect_mode(self):
+        ocr_cycle = self.translation.performance.start_ocr_cycle()
+        error_stage: str | None = None
+
         if self.translation.tts:
             self.translation.speak_text("Detecting text.", timeout_s=self.tts_timeout, show_caption=True)
 
+        scan_start = time.perf_counter()
         try:
             text = self.ocr_scanner.scan_once(save_debug=True)
+            ocr_cycle["ocr_scan_time_s"] = time.perf_counter() - scan_start
         except Exception as e:
+            ocr_cycle["ocr_scan_time_s"] = time.perf_counter() - scan_start
+            error_stage = "ocr_scan"
             if self.translation.tts:
                 self.translation.speak_text("Camera or OCR failed.", timeout_s=self.tts_timeout, show_caption=True)
             print("Detect error:", e)
+            self.translation.performance.complete_ocr_cycle(ocr_cycle, success=False, error_stage=error_stage)
             return
 
-        if not text:
+        cleaned = (text or "").strip()
+        ocr_cycle["ocr_text_found"] = bool(cleaned)
+        ocr_cycle["ocr_chars"] = len(cleaned)
+        ocr_cycle["ocr_words"] = len(cleaned.split()) if cleaned else 0
+
+        if not cleaned:
             if self.translation.tts:
                 self.translation.speak_text("No readable text found.", timeout_s=self.tts_timeout, show_caption=True)
+            self.translation.performance.complete_ocr_cycle(ocr_cycle, success=False, error_stage=None)
             return
 
         print("OCR text:\n", text)
@@ -319,13 +416,21 @@ class WakeWordTranslationAssistant:
         # Store original OCR text and show it first, without translating
         self._ocr_original_text = text
         self._set_ocr_display_text(text, translated=False)
+        ocr_cycle["ocr_pages"] = len(self._ocr_pages)
 
         if not self._ocr_pages:
+            error_stage = "ocr_display"
             if self.translation.tts:
                 self.translation.speak_text("Nothing to show.", timeout_s=self.tts_timeout, show_caption=True)
+            self.translation.performance.complete_ocr_cycle(ocr_cycle, success=False, error_stage=error_stage)
             return
 
-        self._show_current_ocr_page()
+        try:
+            self._show_current_ocr_page()
+        except Exception:
+            self.logger.exception("Failed to show OCR page.")
+            self.translation.performance.complete_ocr_cycle(ocr_cycle, success=False, error_stage="ocr_display")
+            return
 
         if self.translation.tts:
             self.translation.speak_text(
@@ -336,21 +441,39 @@ class WakeWordTranslationAssistant:
             )
             self._show_current_ocr_page()
 
-        self._run_ocr_reading_loop()
+        self._run_ocr_reading_loop(ocr_cycle)
+        final_error_stage = error_stage or ocr_cycle.get("error_stage")
+        self.translation.performance.complete_ocr_cycle(
+            ocr_cycle,
+            success=True,
+            error_stage=final_error_stage if isinstance(final_error_stage, str) else None,
+        )
 
-    def _run_ocr_reading_loop(self) -> None:
+    def _run_ocr_reading_loop(self, ocr_cycle: dict[str, object]) -> None:
         while True:
+            record_start = time.perf_counter()
             audio_path = self.translation.record(filename="ocr_command.wav")
+            record_time = time.perf_counter() - record_start
             if not audio_path:
                 continue
 
+            stt_start = time.perf_counter()
             try:
                 command_text = self.translation.transcribe(
                     language_override="en",
                     delete=True,
                 )
+                stt_time = time.perf_counter() - stt_start
             except Exception:
+                stt_time = time.perf_counter() - stt_start
                 self.logger.exception("OCR command transcription failed.")
+                ocr_cycle["error_stage"] = ocr_cycle.get("error_stage") or "ocr_command_stt"
+                self.translation.performance.record_ocr_command(
+                    ocr_cycle,
+                    record_time_s=record_time,
+                    stt_time_s=stt_time,
+                    intent=None,
+                )
                 if self.translation.tts:
                     self.translation.speak_text(
                         "Say next page, previous page, translate text, or stop reading.",
@@ -363,6 +486,12 @@ class WakeWordTranslationAssistant:
 
             print(f"OCR command: {command_text}")
             intent = self._get_ocr_command(command_text)
+            self.translation.performance.record_ocr_command(
+                ocr_cycle,
+                record_time_s=record_time,
+                stt_time_s=stt_time,
+                intent=intent,
+            )
 
             if intent == "next":
                 if self._ocr_page_index < len(self._ocr_pages) - 1:
@@ -378,7 +507,19 @@ class WakeWordTranslationAssistant:
 
             if intent == "translate":
                 if not self._ocr_is_translated:
-                    self._translate_ocr_text()
+                    try:
+                        self._translate_ocr_text(ocr_cycle)
+                    except Exception:
+                        self.logger.exception("OCR text translation failed.")
+                        ocr_cycle["error_stage"] = "ocr_translate"
+                        if self.translation.tts:
+                            self.translation.speak_text(
+                                "Translation failed.",
+                                timeout_s=self.tts_timeout,
+                                ttl_ms=2000,
+                                show_caption=True,
+                            )
+                            self._show_current_ocr_page()
                 else:
                     self._show_current_ocr_page()
                 continue
@@ -586,7 +727,12 @@ class WakeWordTranslationAssistant:
             self.detector.stop()
             self.detector.cleanup()
             self.translation.recorder.cleanup()
-            # Full program shutdown only
+            self.translation.print_performance_summary()
+            summary_latest, speech_latest, ocr_latest, _, _, _ = self.translation.save_performance_reports()
+            print("Saved:")
+            print(f"  {summary_latest}")
+            print(f"  {speech_latest}")
+            print(f"  {ocr_latest}")
             self.translation.shutdown_captions_overlay()
 
 
