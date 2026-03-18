@@ -24,6 +24,8 @@ from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
 import subprocess
 import sys
 
+import textwrap
+
 from .npu.whisper_qnn_stt import WhisperQnnSTT
 from .recorder import AudioRecorder
 from .tts import _TTS
@@ -339,6 +341,9 @@ class TranslatorPipeline:
         self.translator = MultiLanguageTranslator()
         self.tts = _TTS(preferred_lang=self.target_lang) if self.speak else None
 
+        self._caption_rotation_lock = threading.Lock()
+        self._caption_rotation_id = 0
+
         self._captions_overlay_proc = None
         if launch_captions_overlay:
             self._kill_stale_captions_overlays()
@@ -460,6 +465,47 @@ class TranslatorPipeline:
         if self.tts:
             self.tts.set_language(target_lang)
 
+    @staticmethod
+    def _chunk_text_for_caption_display(
+        text: str,
+        *,
+        max_chars_per_line: int = 48,
+        max_lines: int = 3,
+    ) -> list[str]:
+        cleaned = " ".join((text or "").split())
+        if not cleaned:
+            return []
+
+        lines = textwrap.wrap(
+            cleaned,
+            width=max_chars_per_line,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+
+        return [
+            "\n".join(lines[i:i + max_lines])
+            for i in range(0, len(lines), max_lines)
+        ]
+
+    def _next_caption_rotation_id(self) -> int:
+        with self._caption_rotation_lock:
+            self._caption_rotation_id += 1
+            return self._caption_rotation_id
+
+    def _send_caption_now(
+        self,
+        text: str,
+        ttl_ms: int | None = 9000,
+        *,
+        format_text: bool = True,
+    ) -> None:
+        try:
+            if getattr(self, "captions", None):
+                self.captions.send(text, ttl_ms=ttl_ms, format_text=format_text)
+        except Exception as e:
+            self.logger.warning("Failed to send captions: %s", e)
+
     def show_caption(
         self,
         text: str,
@@ -470,11 +516,60 @@ class TranslatorPipeline:
         cleaned = (text or "").strip()
         if not cleaned:
             return
-        try:
-            if getattr(self, "captions", None):
-                self.captions.send(cleaned, ttl_ms=ttl_ms, format_text=format_text)
-        except Exception as e:
-            self.logger.warning("Failed to send captions: %s", e)
+
+        # Cancel any previous rotating caption sequence.
+        self._next_caption_rotation_id()
+        self._send_caption_now(cleaned, ttl_ms=ttl_ms, format_text=format_text)
+
+    def show_translation_caption(
+        self,
+        text: str,
+        *,
+        page_duration_ms: int = 5000,
+        final_ttl_ms: int = 9000,
+    ) -> None:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return
+
+        pages = self._chunk_text_for_caption_display(
+            cleaned,
+            max_chars_per_line=48,
+            max_lines=2,
+        )
+
+        if not pages:
+            return
+
+        rotation_id = self._next_caption_rotation_id()
+
+        if len(pages) == 1:
+            self._send_caption_now(
+                pages[0],
+                ttl_ms=final_ttl_ms,
+                format_text=False,
+            )
+            return
+
+        def worker() -> None:
+            for i, page in enumerate(pages):
+                with self._caption_rotation_lock:
+                    if rotation_id != self._caption_rotation_id:
+                        return
+
+                is_last = i == len(pages) - 1
+                ttl = final_ttl_ms if is_last else page_duration_ms + 250
+
+                self._send_caption_now(
+                    page,
+                    ttl_ms=ttl,
+                    format_text=False,
+                )
+
+                if not is_last:
+                    time.sleep(page_duration_ms / 1000.0)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def speak_text(
         self,
@@ -497,7 +592,7 @@ class TranslatorPipeline:
     def translate_transcription(self, transcription: str, *, skip_tts: bool = False) -> str:
         translated = self.translator.translate(transcription, self.source_lang, self.target_lang)
         if translated:
-            self.show_caption(translated, ttl_ms=9000)
+            self.show_translation_caption(translated)
             if not skip_tts and self.speak and self.tts:
                 try:
                     self.tts.start(translated, timeout_s=self.tts_timeout)
@@ -509,7 +604,7 @@ class TranslatorPipeline:
     def translate_text(self, text: str) -> str:
         translated = self.translator.translate(text, self.source_lang, self.target_lang)
         if translated:
-            self.show_caption(translated, ttl_ms=9000)
+            self.show_translation_caption(translated)
             if self.speak and self.tts:
                 try:
                     self.tts.start(translated, timeout_s=self.tts_timeout)
@@ -845,6 +940,7 @@ class TranslatorPipeline:
         self._kill_stale_captions_overlays()
 
     def clear_captions(self) -> None:
+        self._next_caption_rotation_id()
         try:
             if getattr(self, "captions", None):
                 self.captions.clear()
