@@ -425,13 +425,6 @@ class WakeWordTranslationAssistant:
             self.translation.performance.complete_ocr_cycle(ocr_cycle, success=False, error_stage=error_stage)
             return
 
-        try:
-            self._show_current_ocr_page()
-        except Exception:
-            self.logger.exception("Failed to show OCR page.")
-            self.translation.performance.complete_ocr_cycle(ocr_cycle, success=False, error_stage="ocr_display")
-            return
-
         if self.translation.tts:
             self.translation.speak_text(
                 "Reading mode. Say next page, previous page, translate text, or stop reading.",
@@ -443,7 +436,17 @@ class WakeWordTranslationAssistant:
                 ttl_ms=3500,
             )
             time.sleep(3.5)
+
+        try:
             self._show_current_ocr_page()
+        except Exception:
+            self.logger.exception("Failed to show OCR page.")
+            self.translation.performance.complete_ocr_cycle(
+                ocr_cycle,
+                success=False,
+                error_stage="ocr_display",
+            )
+            return
 
         self._run_ocr_reading_loop(ocr_cycle)
         final_error_stage = error_stage or ocr_cycle.get("error_stage")
@@ -691,6 +694,10 @@ class WakeWordTranslationAssistant:
                             timeout_s=self.tts_timeout,
                             show_caption=False,
                         )
+                    self.translation.show_caption(
+                        "Say translate or detect to continue, or say stop listening to finish.",
+                        ttl_ms=None,
+                    )
                     continue
 
                 if self.translation.source_lang != "en":
@@ -708,6 +715,10 @@ class WakeWordTranslationAssistant:
                         timeout_s=self.tts_timeout,
                         show_caption=False,
                     )
+                self.translation.show_caption(
+                    "Say translate or detect to continue, or say stop listening to finish.",
+                    ttl_ms=None,
+                )
         finally:
             if not self._should_exit:
                 self.detector.start()
