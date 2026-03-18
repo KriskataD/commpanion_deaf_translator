@@ -179,6 +179,125 @@ class WakeWordTranslationAssistant:
 
         return None
 
+    @staticmethod
+    def _language_name_to_code() -> dict[str, str]:
+        return {
+            "english": "en",
+            "bulgarian": "bg",
+            "french": "fr",
+            "german": "de",
+            "spanish": "es",
+            "italian": "it",
+            "portuguese": "pt",
+            "romanian": "ro",
+            "polish": "pl",
+            "hindi": "hi",
+            "indian": "hi",
+            "chinese": "zh",
+            "mandarin": "zh",
+            "russian": "ru",
+            "turkish": "tr",
+            "ukrainian": "uk",
+        }
+
+    @staticmethod
+    def _language_code_to_name() -> dict[str, str]:
+        return {
+            "en": "English",
+            "bg": "Bulgarian",
+            "fr": "French",
+            "de": "German",
+            "es": "Spanish",
+            "it": "Italian",
+            "pt": "Portuguese",
+            "ro": "Romanian",
+            "pl": "Polish",
+            "hi": "Hindi",
+            "zh": "Chinese",
+            "ru": "Russian",
+            "tr": "Turkish",
+            "uk": "Ukrainian",
+        }
+
+    def _resolve_target_language_code(self, spoken_text: str) -> str | None:
+        supported = set(self.translation.translator.supported_languages())
+        normalized = " ".join((spoken_text or "").lower().split())
+
+        # Allow simple answers like "French" and also phrases like "translate to French"
+        for prefix in ("translate to ", "to ", "into ", "in "):
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix):].strip()
+
+        normalized = normalized.replace(" language", "").strip()
+
+        # Direct code support, e.g. "fr", "de"
+        if normalized in supported:
+            return normalized
+
+        code = self._language_name_to_code().get(normalized)
+        if code in supported:
+            return code
+
+        return None
+
+    def _ask_ocr_translation_language(self) -> str:
+        fallback = self.translation.target_lang
+        fallback_name = self._language_code_to_name().get(fallback, fallback)
+
+        if self.translation.tts:
+            self.translation.speak_text(
+                "What language do you want the text translated to?",
+                timeout_s=self.tts_timeout,
+                ttl_ms=4000,
+                show_caption=True,
+            )
+
+        time.sleep(0.1)
+        audio_path = self.translation.record(filename="ocr_target_language.wav")
+        if not audio_path:
+            if self.translation.tts:
+                self.translation.speak_text(
+                    f"I did not catch the language. Using {fallback_name}.",
+                    timeout_s=self.tts_timeout,
+                    ttl_ms=2500,
+                    show_caption=True,
+                )
+            return fallback
+
+        try:
+            spoken = self.translation.transcribe(language_override="en", delete=True)
+        except Exception:
+            self.logger.exception("Failed to transcribe OCR target language request.")
+            if self.translation.tts:
+                self.translation.speak_text(
+                    f"I had trouble understanding the language. Using {fallback_name}.",
+                    timeout_s=self.tts_timeout,
+                    ttl_ms=2500,
+                    show_caption=True,
+                )
+            return fallback
+
+        resolved = self._resolve_target_language_code(spoken)
+        if not resolved:
+            if self.translation.tts:
+                self.translation.speak_text(
+                    f"I did not recognize {spoken}. Using {fallback_name}.",
+                    timeout_s=self.tts_timeout,
+                    ttl_ms=2500,
+                    show_caption=True,
+                )
+            return fallback
+
+        if self.translation.tts:
+            resolved_name = self._language_code_to_name().get(resolved, resolved)
+            self.translation.speak_text(
+                f"Okay. Translating to {resolved_name}.",
+                timeout_s=self.tts_timeout,
+                ttl_ms=2000,
+                show_caption=True,
+            )
+
+        return resolved
 
     def _set_ocr_display_text(self, text: str, *, translated: bool) -> None:
         self._ocr_display_text = text or ""
@@ -202,16 +321,21 @@ class WakeWordTranslationAssistant:
         )
 
 
-    def _translate_ocr_text(self, ocr_cycle: dict[str, object] | None = None) -> None:
+    def _translate_ocr_text(
+        self,
+        ocr_cycle: dict[str, object] | None = None,
+        target_lang: str | None = None,
+    ) -> None:
         if not self._ocr_original_text.strip():
             return
 
         translate_start = time.perf_counter()
         try:
+            selected_target = target_lang or self.translation.target_lang
             translated = self.translation.translator.translate(
                 self._ocr_original_text,
                 source_lang="en",   # keep your current OCR demo assumption
-                target_lang=self.translation.target_lang,
+                target_lang=selected_target,
             )
             elapsed = time.perf_counter() - translate_start
         except Exception:
@@ -515,7 +639,8 @@ class WakeWordTranslationAssistant:
             if intent == "translate":
                 if not self._ocr_is_translated:
                     try:
-                        self._translate_ocr_text(ocr_cycle)
+                        target_lang = self._ask_ocr_translation_language()
+                        self._translate_ocr_text(ocr_cycle, target_lang=target_lang)
                     except Exception:
                         self.logger.exception("OCR text translation failed.")
                         ocr_cycle["error_stage"] = "ocr_translate"
