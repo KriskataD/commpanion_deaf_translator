@@ -436,9 +436,13 @@ class WakeWordTranslationAssistant:
             self.translation.speak_text(
                 "Reading mode. Say next page, previous page, translate text, or stop reading.",
                 timeout_s=self.tts_timeout,
-                ttl_ms=2500,
-                show_caption=True,
+                show_caption=False,
             )
+            self.translation.show_caption(
+                "Reading mode. Say next page, previous page, translate text, or stop reading.",
+                ttl_ms=3500,
+            )
+            time.sleep(3.5)
             self._show_current_ocr_page()
 
         self._run_ocr_reading_loop(ocr_cycle)
