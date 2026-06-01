@@ -2,6 +2,7 @@ import os
 import re
 import threading
 import time
+import logging
 from pathlib import Path
 from queue import Queue
 
@@ -21,7 +22,7 @@ class _TTS:
     A wrapper around the pyttsx3 engine to convert text to speech, used to vocalize complete sentences.
     """
 
-    def __init__(self, rate: int = 1):
+    def __init__(self, rate: int = 1, preferred_lang: str | None = None):
         """
         Initialize the pyttsx3 text-to-speech engine.
 
@@ -29,6 +30,8 @@ class _TTS:
             rate (int): Speed of speech in words per minute. Default is 170.
         """
         self._rate = rate
+        self._preferred_lang = (preferred_lang or "").lower() or None
+        self._logger = logging.getLogger(__name__)
         self._use_sapi = os.name == "nt" and win32_client is not None and pythoncom is not None
         self._sapi_voice = None
         if not self._use_sapi:
@@ -72,8 +75,50 @@ class _TTS:
             voice = win32_client.Dispatch("SAPI.SpVoice")
             voice.Rate = self._rate
             voice.Volume = 100
+            self._select_sapi_voice_for_language(voice)
             self._sapi_voice = voice
         return self._sapi_voice
+
+    def set_language(self, lang_code: str | None) -> None:
+        self._preferred_lang = (lang_code or "").lower() or None
+        if self._use_sapi and self._sapi_voice is not None:
+            self._select_sapi_voice_for_language(self._sapi_voice)
+
+    def _select_sapi_voice_for_language(self, voice) -> None:
+        if self._preferred_lang != "bg":
+            return
+
+        try:
+            voices = voice.GetVoices()
+        except Exception:
+            self._logger.info("Unable to enumerate SAPI voices for Bulgarian selection.")
+            return
+
+        selected_voice = None
+        for i in range(voices.Count):
+            token = voices.Item(i)
+            description = (token.GetDescription() or "").lower()
+            name = (token.GetAttribute("Name") or "").lower()
+            languages = (token.GetAttribute("Language") or "").lower()
+            if (
+                "bulgarian" in description
+                or "bulgarian" in name
+                or "bg-bg" in description
+                or "bg-bg" in name
+                or "0402" in languages
+                or any(part.strip() == "402" for part in languages.replace(",", ";").split(";"))
+            ):
+                selected_voice = token
+                break
+
+        if selected_voice is None:
+            self._logger.info("No Bulgarian SAPI voice found; using default system voice.")
+            return
+
+        try:
+            voice.Voice = selected_voice
+        except Exception:
+            self._logger.info("Failed to select Bulgarian SAPI voice; using default system voice.")
 
     def _sapi_speak(self, text_: str, timeout_s: float | None) -> None:
         voice = self._get_sapi_voice()

@@ -48,9 +48,11 @@ The `WakeWordTranslationAssistant` orchestrates the full loop; `TranslatorPipeli
 
 - Wake-word activation (`hey_jarvis` by default; configurable)
 - **Stay-awake mode** — keep translating after each utterance without re-triggering the wake word (`--stay-awake`)
+- **OCR detection mode** — point AR glasses at printed text; EasyOCR (quantized, QNN-accelerated) reads and translates it, overlaying subtitles via a captions client
+- **AR subtitle overlay** — translated text is displayed as on-screen captions in real time
 - Voice stop commands — say *"stop listening"* or *"stop Jarvis"* to exit
 - Non-English source language support — stop commands are re-verified with an English transcription pass
-- Translate mode and sign-language detect mode routing (sign-language branch is a future extension)
+- Performance tracking — per-session STT, translation, and OCR timing metrics logged on shutdown
 - Configurable TTS timeout to prevent playback hangs
 - Debug logging for wake word scores, encoder/decoder IO shapes, and token selection
 
@@ -61,9 +63,11 @@ The `WakeWordTranslationAssistant` orchestrates the full loop; `TranslatorPipeli
 | Layer | Technology |
 |---|---|
 | Wake word | [openWakeWord](https://github.com/dscripka/openWakeWord) |
-| Speech recognition | OpenAI Whisper Small (quantized) via ONNX Runtime + QNN |
+| Speech recognition | OpenAI Whisper Small / Large-v3-Turbo (quantized) via ONNX Runtime + QNN |
+| OCR | EasyOCR (quantized detector + recogniser) via ONNX Runtime + QNN |
 | NPU runtime | Qualcomm QNN SDK / `QNNExecutionProvider` |
 | Translation | `facebook/m2m100_418M` (HuggingFace Transformers) |
+| AR subtitles | Custom captions overlay client |
 | Text-to-speech | Windows SAPI via `pywin32`; `pyttsx3` fallback |
 | Audio I/O | PyAudio |
 | ML frameworks | PyTorch, ONNX Runtime |
@@ -168,14 +172,25 @@ python -m src.wake_translation_assistant ...
 ```
 src/
 ├── wake_translation_assistant.py   # Top-level orchestrator: wake word → route → pipeline
-├── translator.py                   # TranslatorPipeline: record → STT → translate → TTS
+├── translator.py                   # TranslatorPipeline: record → STT → translate → TTS + OCR
 ├── recorder.py                     # PyAudio recorder with silence detection
 ├── wakeword_detector.py            # openWakeWord wrapper with callback registration
 ├── tts.py                          # Windows SAPI / pyttsx3 TTS with worker queue
+├── captions_client.py              # AR subtitle overlay client
+├── captions_overlay.py             # Subtitle rendering logic
 ├── yolov8Objects.py                # YOLOv8 object locator (future sign-language extension)
+├── ocr/
+│   ├── easyocr_qnn.py              # EasyOCR detector + recogniser via QNN
+│   └── scan_once.py                # Single-frame OCR scan helper
 └── npu/
     ├── ort_qnn.py                  # ONNX Runtime session factory (QNNExecutionProvider)
-    └── whisper_qnn_stt.py          # Quantized Whisper encoder+decoder inference loop
+    ├── whisper_qnn_stt.py          # Public API facade for Whisper QNN STT
+    └── whisper/                    # Whisper inference internals
+        ├── stt.py                  # WhisperQnnSTT / model profiles
+        ├── decoder_runtime.py      # Autoregressive decoder loop + KV cache
+        ├── audio_features.py       # Mel spectrogram extraction
+        ├── token_selection.py      # Greedy decoding + repeat guards
+        └── profiles.py             # Model profile definitions (small, large-v3-turbo)
 scripts/
 └── check_ort_qnn.py                # Utility: verify QNN provider availability
 models/                             # (gitignored) ONNX model directories

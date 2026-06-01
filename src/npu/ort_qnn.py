@@ -18,6 +18,7 @@ def get_providers() -> list[str]:
 def make_session(
     onnx_path: str | Path,
     providers: list[str] | None = None,
+    sess_options: ort.SessionOptions | None = None,
 ) -> ort.InferenceSession:
     """Create an ONNX Runtime session with QNN only by default."""
     onnx_path = str(onnx_path)
@@ -33,7 +34,7 @@ def make_session(
             )
         logger.info("QNNExecutionProvider is available.")
 
-    sess_options = ort.SessionOptions()
+    sess_options = sess_options or ort.SessionOptions()
     ort_providers: list[str] | list[tuple[str, dict[str, str]]] = providers
     if qnn_backend_path and "QNNExecutionProvider" in providers:
         ort_providers = [
