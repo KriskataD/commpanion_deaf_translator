@@ -1,38 +1,183 @@
-# Commpanion Deaf Translator
+# Commpanion — Real-Time Speech Translator for Deaf and Hard-of-Hearing Users
 
-Wake-word controlled pipeline that records speech, transcribes it with Whisper (ONNX), translates with M2M100, and plays the result with TTS. YOLOv8 helpers are included for future sign-language/vision work.
+An edge AI assistant that listens for a wake word, transcribes speech using a **quantized Whisper model running on a Qualcomm NPU**, translates it with Meta's M2M100 model, and speaks the result aloud — entirely on-device, with no cloud dependency for the STT step.
 
-## Layout
-- `src/wake_translation_assistant.py` – wake-word loop that routes to translation (sign-language branch placeholder).
-- `src/translator.py` – record → STT → translate → TTS pipeline.
-- `src/stt.py` – WhisperBaseEn ONNX runner (place ONNX exports in `src/models/`).
-- `src/tts.py` – pyttsx3 helper.
-- `src/recorder.py` – microphone capture with silence detection.
-- `src/wakeword_detector.py` – openWakeWord wrapper.
-- `src/yolov8Objects.py` – YOLOv8 object locator (kept for vision/sign language work).
+This project was developed as a Final Year Project at University College Cork (UCC), with a focus on running inference on-device hardware accelerators (NPU/DSP) via Qualcomm's QNN SDK.
+
+---
+
+## Key Technical Highlights
+
+- **NPU-accelerated inference** — Whisper Small quantized to INT8/FP16 and executed via ONNX Runtime's `QNNExecutionProvider` on a Qualcomm Snapdragon NPU/DSP.
+- **Custom autoregressive decoder loop** — manually manages KV self-cache, cross-attention cache, attention masks, and position IDs to drive the quantized decoder step-by-step outside of HuggingFace's generate loop.
+- **Multilingual translation** — Meta's M2M100 (418M) supports direct translation between 100+ language pairs, no pivot through English required.
+- **Wake-word activated pipeline** — openWakeWord listens continuously in the background; the pipeline only activates on a detected wake word, minimising power use.
+- **Thread-safe audio handling** — recording, wake-word detection, TTS playback, and the main loop each run on separate threads with lock-guarded state.
+
+---
+
+## Architecture
+
+```
+Microphone
+    │
+    ▼
+WakeWordDetector (openWakeWord, background thread)
+    │  wake word detected
+    ▼
+AudioRecorder (PyAudio + silence detection)
+    │  .wav file
+    ▼
+WhisperSmallQuantizedQNNSTT (ONNX Runtime + QNNExecutionProvider)
+    │  transcription text
+    ▼
+MultiLanguageTranslator (facebook/m2m100_418M, HuggingFace)
+    │  translated text
+    ▼
+TTS (_TTS via Windows SAPI / pyttsx3)
+    │
+    ▼
+Speaker output
+```
+
+The `WakeWordTranslationAssistant` orchestrates the full loop; `TranslatorPipeline` owns the STT/translation/TTS components.
+
+---
+
+## Features
+
+- Wake-word activation (`hey_jarvis` by default; configurable)
+- **Stay-awake mode** — keep translating after each utterance without re-triggering the wake word (`--stay-awake`)
+- Voice stop commands — say *"stop listening"* or *"stop Jarvis"* to exit
+- Non-English source language support — stop commands are re-verified with an English transcription pass
+- Translate mode and sign-language detect mode routing (sign-language branch is a future extension)
+- Configurable TTS timeout to prevent playback hangs
+- Debug logging for wake word scores, encoder/decoder IO shapes, and token selection
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Wake word | [openWakeWord](https://github.com/dscripka/openWakeWord) |
+| Speech recognition | OpenAI Whisper Small (quantized) via ONNX Runtime + QNN |
+| NPU runtime | Qualcomm QNN SDK / `QNNExecutionProvider` |
+| Translation | `facebook/m2m100_418M` (HuggingFace Transformers) |
+| Text-to-speech | Windows SAPI via `pywin32`; `pyttsx3` fallback |
+| Audio I/O | PyAudio |
+| ML frameworks | PyTorch, ONNX Runtime |
+
+---
 
 ## Setup
-1) Python 3.10+ recommended.  
-2) Install deps: `pip install -r requirements.txt` (PyAudio may need OS-specific tooling).  
-3) Models:
-   - Whisper ONNX: export `whisper_base_en-whisperencoderinf.onnx` and `whisper_base_en-whisperdecoderinf.onnx` into `src/models/`.
-   - Wake word: `openwakeword` downloads defaults on first run; to use a custom model, place it in `src/models/` and pass `--wakeword path/to/model.onnx`.
-   - YOLO: download a YOLOv8 weights file (e.g., `yolov8l-oiv7.pt`) into `src/models/` and update `src/yolov8Objects.py` if you want to run it.
 
-## Run the translation pipeline
-```bash
-python -m src.wake_translation_assistant --source-lang en --target-lang fr
-```
-- Say the wake word (default: `hey_jarvis`).  
-- After the prompt, speak the phrase to translate; translation is spoken back via TTS.  
-- Saying something about "sign language" will currently reply that the branch is not ready.
+**Requirements:** Python 3.10+, Windows (SAPI TTS), Qualcomm device with QNN runtime for NPU inference (CPU fallback available via env vars).
 
-For a translation-only loop without wake word you can also run:
 ```bash
-python -m src.translator --source-lang en --target-lang fr --once
+pip install -r requirements.txt
 ```
 
-## Notes
-- This repo focuses only on STT, translation, TTS, wake word, and YOLOv8 helpers extracted from `commpanion-blind-deaf`. Other intents (OCR, BLIP, collision detection, etc.) are omitted.  
-- The pipeline uses the first available microphone detected by PyAudio; adjust `MicrophoneSelector` or `TranslatorPipeline` if you need a specific device.  
-- The YOLO module depends on `lmstudio` only if you want to run the LLM-based object locator.
+PyAudio may require OS-specific build tooling (e.g. `pipwin install pyaudio` on Windows).
+
+### Models
+
+| Model | How to obtain |
+|---|---|
+| QNN Whisper encoder | Export from `openai/whisper-small` with Qualcomm AI Hub or ONNX export tools; quantize to INT8/FP16 |
+| QNN Whisper decoder | Same export pipeline as encoder |
+| M2M100 | Downloaded automatically from HuggingFace on first run |
+| Wake word | `openwakeword` downloads `hey_jarvis` automatically on first run |
+
+Place the ONNX model directories at:
+```
+models/
+  whisper_small_quantized_encoder_optimized_onnx/
+    model.onnx
+    model.bin
+  whisper_small_quantized_decoder_optimized_onnx/
+    model.onnx
+    model.bin
+```
+
+Or override with `--qnn-encoder-dir` / `--qnn-decoder-dir` flags, or the `QNN_ENCODER_DIR` / `QNN_DECODER_DIR` environment variables.
+
+---
+
+## Usage
+
+### Full wake-word pipeline
+
+```bash
+python -m src.wake_translation_assistant \
+  --source-lang en \
+  --target-lang fr \
+  --qnn-encoder-dir models/whisper_small_quantized_encoder_optimized_onnx \
+  --qnn-decoder-dir models/whisper_small_quantized_decoder_optimized_onnx
+```
+
+Say **"hey Jarvis"**, then say **"translate"**, then speak your phrase. The translation is spoken back via TTS.
+
+### Stay-awake mode (continuous translation)
+
+```bash
+python -m src.wake_translation_assistant \
+  --source-lang bg \
+  --target-lang en \
+  --qnn-encoder-dir models/whisper_small_quantized_encoder_optimized_onnx \
+  --qnn-decoder-dir models/whisper_small_quantized_decoder_optimized_onnx \
+  --stay-awake \
+  --no-prompt \
+  --tts-timeout 5
+```
+
+### Single translation (no wake word)
+
+```bash
+python -m src.translator \
+  --source-lang en \
+  --target-lang fr \
+  --once \
+  --qnn-encoder-dir models/whisper_small_quantized_encoder_optimized_onnx \
+  --qnn-decoder-dir models/whisper_small_quantized_decoder_optimized_onnx
+```
+
+### Useful flags
+
+| Flag | Description |
+|---|---|
+| `--stay-awake` | Keep translating after each phrase without re-triggering the wake word |
+| `--no-speak` | Disable TTS output |
+| `--no-prompt` | Skip the spoken prompt before recording |
+| `--tts-timeout N` | Stop TTS playback after N seconds |
+| `--wake-debug` | Log wake word scores every second for microphone/detection debugging |
+| `--wake-mic-index N` | Force a specific PyAudio input device index for wake word detection |
+
+### CPU fallback (debugging without QNN hardware)
+
+```bash
+set QNN_ENCODER_CPU=1
+set QNN_DECODER_CPU=1
+python -m src.wake_translation_assistant ...
+```
+
+---
+
+## Project Structure
+
+```
+src/
+├── wake_translation_assistant.py   # Top-level orchestrator: wake word → route → pipeline
+├── translator.py                   # TranslatorPipeline: record → STT → translate → TTS
+├── recorder.py                     # PyAudio recorder with silence detection
+├── wakeword_detector.py            # openWakeWord wrapper with callback registration
+├── tts.py                          # Windows SAPI / pyttsx3 TTS with worker queue
+├── yolov8Objects.py                # YOLOv8 object locator (future sign-language extension)
+└── npu/
+    ├── ort_qnn.py                  # ONNX Runtime session factory (QNNExecutionProvider)
+    └── whisper_qnn_stt.py          # Quantized Whisper encoder+decoder inference loop
+scripts/
+└── check_ort_qnn.py                # Utility: verify QNN provider availability
+models/                             # (gitignored) ONNX model directories
+audio/                              # (gitignored) Temporary WAV recordings
+```

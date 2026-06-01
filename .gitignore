@@ -3,3 +3,13 @@ src/models/*.onnx
 src/models/*.bin
 __pycache__/
 *.pyc
+
+# Ignore generated/exported assets
+export_assets/
+
+# Ignore all model artifacts
+src/models/
+
+audio/
+
+.vscode/

@@ -1,5 +1,5 @@
 """
-Translator pipeline using Whisper-based STT, M2M100 translation, and optional TTS playback.
+Translator pipeline using QNN Whisper STT, M2M100 translation, and optional TTS playback.
 
 Speak into the microphone, the audio is recorded until silence is detected,
 transcribed, translated, and the translated text is printed and spoken.
@@ -7,16 +7,19 @@ transcribed, translated, and the translated text is printed and spoken.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import logging
 import threading
 import time
+import os
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
 
+from .npu.whisper_qnn_stt import WhisperSmallQuantizedQNNSTT
 from .recorder import AudioRecorder
-from .stt import SpeechToTextApplication
 from .tts import _TTS
 
 
@@ -58,6 +61,10 @@ class TranslatorPipeline:
         source_lang: str = "en",
         target_lang: str = "fr",
         speak: bool = True,
+        qnn_encoder_dir: str | Path = "models/whisper_small_quantized_encoder_optimized_onnx",
+        qnn_decoder_dir: str | Path = "models/whisper_small_quantized_decoder_optimized_onnx",
+        stt_timeout: float | None = None,
+        tts_timeout: float | None = None,
     ) -> None:
         self.audio_dir = Path(audio_dir)
         self.audio_dir.mkdir(parents=True, exist_ok=True)
@@ -65,11 +72,15 @@ class TranslatorPipeline:
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.speak = speak
+        self.stt_timeout = stt_timeout
+        self.tts_timeout = tts_timeout
 
+        self.logger = logging.getLogger(__name__)
         self.recorder = AudioRecorder()
-        self.stt = SpeechToTextApplication(audio_records_path=self.audio_dir)
+        self.stt = self._build_stt_backend(qnn_encoder_dir, qnn_decoder_dir)
         self.translator = MultiLanguageTranslator()
-        self.tts = _TTS()
+        self.tts = _TTS() if self.speak else None
+        self.last_audio_path: Path | None = None
 
         self._mic_lock = threading.Lock()
         default_mic = self.recorder.mic_selector.get_default_microphone()
@@ -89,11 +100,80 @@ class TranslatorPipeline:
             output_path = self.audio_dir / filename
             self.recorder.save_recording(str(output_path))
             self.recorder.cleanup()
-        return output_path if output_path.exists() else None
+        self.last_audio_path = output_path if output_path.exists() else None
+        return self.last_audio_path
 
-    def transcribe(self) -> str:
+    def _run_with_timeout(self, fn: Callable[[], str], label: str) -> str:
+        if self.stt_timeout is None:
+            return fn()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(fn)
+            try:
+                return future.result(timeout=self.stt_timeout)
+            except concurrent.futures.TimeoutError:
+                self.logger.error("%s timed out after %.1fs.", label, self.stt_timeout)
+                future.cancel()
+                return ""
+            except Exception:
+                self.logger.exception("%s failed.", label)
+                return ""
+
+    def transcribe(self, language_override: str | None = None, delete: bool = True) -> str:
         """Transcribe the last recorded audio file using Whisper."""
-        return self.stt.transcribe()
+        if not self.last_audio_path:
+            raise FileNotFoundError("No recorded audio available for QNN STT.")
+        try:
+            return self._run_with_timeout(
+                lambda: self.stt.transcribe_wav(self.last_audio_path, language=language_override),
+                "QNN STT transcription",
+            )
+        finally:
+            if delete:
+                self.delete_last_audio_file()
+
+    def _build_stt_backend(self, qnn_encoder_dir: str | Path, qnn_decoder_dir: str | Path):
+        encoder_dir, decoder_dir = self._resolve_qnn_model_dirs(qnn_encoder_dir, qnn_decoder_dir)
+        self.logger.info("QNN encoder directory: %s", encoder_dir)
+        self.logger.info("QNN decoder directory: %s", decoder_dir)
+        return WhisperSmallQuantizedQNNSTT(
+            encoder_dir=encoder_dir,
+            decoder_dir=decoder_dir,
+        )
+
+    def _resolve_qnn_model_dirs(
+        self,
+        qnn_encoder_dir: str | Path,
+        qnn_decoder_dir: str | Path,
+    ) -> tuple[Path, Path]:
+        env_encoder = os.getenv("QNN_ENCODER_DIR")
+        env_decoder = os.getenv("QNN_DECODER_DIR")
+
+        base_dir = Path(__file__).resolve().parent
+        candidates = [
+            (Path(qnn_encoder_dir), Path(qnn_decoder_dir)),
+            (Path(qnn_encoder_dir).expanduser(), Path(qnn_decoder_dir).expanduser()),
+            (base_dir / qnn_encoder_dir, base_dir / qnn_decoder_dir),
+            (base_dir.parent / qnn_encoder_dir, base_dir.parent / qnn_decoder_dir),
+        ]
+
+        if env_encoder and env_decoder:
+            candidates.insert(0, (Path(env_encoder), Path(env_decoder)))
+
+        for encoder_dir, decoder_dir in candidates:
+            if encoder_dir.exists() and decoder_dir.exists():
+                return encoder_dir, decoder_dir
+
+        attempted = " | ".join(f"{enc} / {dec}" for enc, dec in candidates)
+        raise FileNotFoundError(
+            "QNN Whisper model directories not found. "
+            "Set --qnn-encoder-dir/--qnn-decoder-dir or QNN_ENCODER_DIR/QNN_DECODER_DIR. "
+            f"Attempted: {attempted}"
+        )
+
+    def delete_last_audio_file(self) -> None:
+        if self.last_audio_path and self.last_audio_path.exists():
+            self.last_audio_path.unlink()
+        self.last_audio_path = None
 
     def set_languages(self, source_lang: str, target_lang: str) -> None:
         """Update the language pair for subsequent translations."""
@@ -102,8 +182,8 @@ class TranslatorPipeline:
 
     def translate_transcription(self, transcription: str) -> str:
         translated = self.translator.translate(transcription, self.source_lang, self.target_lang)
-        if self.speak and translated:
-            self.tts.start(translated)
+        if self.speak and translated and self.tts:
+            self.tts.start(translated, timeout_s=self.tts_timeout)
         print(f"➡️  Translated ({self.source_lang} → {self.target_lang}): {translated}")
         return translated
 
@@ -111,8 +191,8 @@ class TranslatorPipeline:
         """Translate arbitrary text without invoking the STT step."""
 
         translated = self.translator.translate(text, self.source_lang, self.target_lang)
-        if self.speak and translated:
-            self.tts.start(translated)
+        if self.speak and translated and self.tts:
+            self.tts.start(translated, timeout_s=self.tts_timeout)
         print(f"➡️  Translated text ({self.source_lang} → {self.target_lang}): {translated}")
         return translated
 
@@ -124,11 +204,21 @@ class TranslatorPipeline:
             return ""
 
         print("📝 Transcribing...")
-        transcription = self.transcribe()
+        try:
+            transcription = self.transcribe(language_override=self.source_lang, delete=False)
+        except Exception as exc:
+            self.logger.exception("Transcription failed.")
+            print(f"❌ Transcription failed: {exc}")
+            return ""
         print(f"Original text ({self.source_lang}): {transcription}")
 
         print("🌐 Translating...")
-        return self.translate_transcription(transcription)
+        try:
+            return self.translate_transcription(transcription)
+        except Exception as exc:
+            self.logger.exception("Translation failed.")
+            print(f"❌ Translation failed: {exc}")
+            return ""
 
     def run_loop(self) -> None:
         """Continuously record, translate, and optionally speak until interrupted."""
@@ -157,10 +247,26 @@ def _print_language_list(translator: MultiLanguageTranslator) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Speech translator using Whisper STT and M2M100.")
+    logging.basicConfig(level=logging.INFO)
+    parser = argparse.ArgumentParser(description="Speech translator using QNN Whisper STT and M2M100.")
     parser.add_argument("--source-lang", default="en", help="Source language code (e.g., en, fr, es).")
     parser.add_argument("--target-lang", default="fr", help="Target language code (e.g., fr, en, de).")
     parser.add_argument("--audio-dir", default="audio", help="Directory to save recordings.")
+    parser.add_argument(
+        "--qnn-encoder-dir",
+        default="models/whisper_small_quantized_encoder_optimized_onnx",
+        help="Directory containing the QNN Whisper encoder ONNX model (or set QNN_ENCODER_DIR).",
+    )
+    parser.add_argument(
+        "--qnn-decoder-dir",
+        default="models/whisper_small_quantized_decoder_optimized_onnx",
+        help="Directory containing the QNN Whisper decoder ONNX model (or set QNN_DECODER_DIR).",
+    )
+    parser.add_argument(
+        "--stt-timeout",
+        type=float,
+        help="Optional timeout (seconds) for STT transcription to avoid hangs.",
+    )
     parser.add_argument("--no-speak", action="store_true", help="Disable TTS playback of translations.")
     parser.add_argument(
         "--list-languages",
@@ -180,6 +286,9 @@ def main() -> None:
         source_lang=args.source_lang,
         target_lang=args.target_lang,
         speak=not args.no_speak,
+        qnn_encoder_dir=args.qnn_encoder_dir,
+        qnn_decoder_dir=args.qnn_decoder_dir,
+        stt_timeout=args.stt_timeout,
     )
 
     if args.list_languages:
