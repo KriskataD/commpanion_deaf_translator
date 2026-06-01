@@ -1,11 +1,8 @@
-"""Whisper QNN STT public API (thin façade)."""
-from __future__ import annotations
-
-from .whisper.stt import (
-    dump_model_io,
+from .stt import (
+    WhisperLargeV3TurboQNNSTT,
     WhisperQnnSTT,
     WhisperSmallQuantizedQNNSTT,
-    WhisperLargeV3TurboQNNSTT,
+    dump_model_io,
 )
 
 __all__ = [
