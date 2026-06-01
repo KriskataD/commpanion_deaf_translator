@@ -14,7 +14,7 @@ from typing import Callable
 import textwrap
 
 from .translator import TranslatorPipeline
-from .wakeword_detector import WakeWordDetector
+from .audio.wakeword_detector import WakeWordDetector
 from .ocr.scan_once import OcrScanner
 
 

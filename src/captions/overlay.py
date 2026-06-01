@@ -1,4 +1,4 @@
-# src/captions_overlay.py
+# src/captions/overlay.py
 from __future__ import annotations
 
 import argparse

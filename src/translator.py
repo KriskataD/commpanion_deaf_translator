@@ -27,9 +27,9 @@ import sys
 import textwrap
 
 from .npu.whisper_qnn_stt import WhisperQnnSTT
-from .recorder import AudioRecorder
-from .tts import _TTS
-from .captions_client import CaptionsClient
+from .audio.recorder import AudioRecorder
+from .audio.tts import _TTS
+from .captions.client import CaptionsClient
 
 try:
     import psutil
@@ -897,7 +897,7 @@ class TranslatorPipeline:
         cmd = [
             launcher,
             "-m",
-            "src.captions_overlay",
+            "src.captions.overlay",
             "--port",
             str(port),
             "--font-size",
@@ -954,7 +954,8 @@ class TranslatorPipeline:
         script = r"""
     $procs = Get-CimInstance Win32_Process | Where-Object {
         $_.CommandLine -and (
-            $_.CommandLine -match 'src\.captions_overlay' -or
+            $_.CommandLine -match 'src\.captions\.overlay' -or
+            $_.CommandLine -match 'captions[\\/]overlay\.py' -or
             $_.CommandLine -match 'captions_overlay\.py'
         )
     }

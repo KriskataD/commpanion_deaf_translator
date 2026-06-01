@@ -192,12 +192,14 @@ python -m src.wake_translation_assistant ...
 src/
 ├── wake_translation_assistant.py   # Top-level orchestrator: wake word → route → pipeline
 ├── translator.py                   # TranslatorPipeline: record → STT → translate → TTS + OCR
-├── recorder.py                     # PyAudio recorder with silence detection
-├── wakeword_detector.py            # openWakeWord wrapper with callback registration
-├── tts.py                          # Windows SAPI / pyttsx3 TTS with worker queue
-├── captions_client.py              # AR subtitle overlay client
-├── captions_overlay.py             # Subtitle rendering logic
 ├── yolov8Objects.py                # YOLOv8 object locator (future sign-language extension)
+├── audio/
+│   ├── recorder.py                 # PyAudio recorder with silence detection
+│   ├── tts.py                      # Windows SAPI / pyttsx3 TTS with worker queue
+│   └── wakeword_detector.py        # openWakeWord wrapper with callback registration
+├── captions/
+│   ├── client.py                   # AR subtitle overlay client (UDP sender)
+│   └── overlay.py                  # Subtitle rendering window
 ├── ocr/
 │   ├── easyocr_qnn.py              # EasyOCR detector + recogniser via QNN
 │   └── scan_once.py                # Single-frame OCR scan helper
