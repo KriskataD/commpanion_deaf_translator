@@ -1,6 +1,6 @@
 # Commpanion — Real-Time Speech Translator for Deaf and Hard-of-Hearing Users
 
-An edge AI assistant that listens for a wake word, transcribes speech using a **quantized Whisper model running on a Qualcomm NPU**, translates it with Meta's M2M100 model, and speaks the result aloud — entirely on-device, with no cloud dependency for the STT step.
+An edge AI assistant for deaf and hard-of-hearing users with two modes of operation: it can **transcribe and translate spoken speech** using a quantized Whisper model on a Qualcomm NPU, or **detect and translate printed text** from a camera feed using a QNN-accelerated EasyOCR pipeline. In both cases, translations are delivered via TTS and AR subtitle overlay — entirely on-device, with no cloud dependency for inference.
 
 This project was developed as a Final Year Project at University College Cork (UCC), with a focus on running inference on-device hardware accelerators (NPU/DSP) via Qualcomm's QNN SDK.
 
