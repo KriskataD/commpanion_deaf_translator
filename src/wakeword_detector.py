@@ -165,12 +165,10 @@ class WakeWordDetector:
                 self.logger.error(f"Error during audio processing: {e}")
 
     @classmethod
-    def download_models(self):
+    def download_models(cls):
         if not os.path.exists("resources/models"):
-            print("Downloading and installing openWakeWord")
-            # One-time download of all pre-trained models (or only select models)
+            logging.getLogger(__name__).info("Downloading openWakeWord models.")
             download_models()
-            print("✅ openWakeWord installed successfully\n")
     
     def start(self):
         """Start wake word listening."""

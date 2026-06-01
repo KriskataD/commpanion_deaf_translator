@@ -1,10 +1,13 @@
 """ONNX Runtime helpers for QNN execution."""
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 import onnxruntime as ort
+
+logger = logging.getLogger(__name__)
 
 
 def get_providers() -> list[str]:
@@ -28,7 +31,7 @@ def make_session(
                 "Ensure the Qualcomm QNN runtime is installed and ONNX Runtime "
                 "is built with QNN support."
             )
-        print("✅ QNNExecutionProvider is available.")
+        logger.info("QNNExecutionProvider is available.")
 
     sess_options = ort.SessionOptions()
     ort_providers: list[str] | list[tuple[str, dict[str, str]]] = providers
@@ -37,5 +40,5 @@ def make_session(
             ("QNNExecutionProvider", {"backend_path": qnn_backend_path}),
             *[provider for provider in providers if provider != "QNNExecutionProvider"],
         ]
-        print(f"✅ Using QNN backend path: {qnn_backend_path}")
+        logger.info("Using QNN backend path: %s", qnn_backend_path)
     return ort.InferenceSession(onnx_path, sess_options=sess_options, providers=ort_providers)

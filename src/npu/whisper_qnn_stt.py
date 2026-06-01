@@ -11,7 +11,6 @@ import time
 
 import numpy as np
 import onnxruntime as ort
-import torch
 from transformers import WhisperTokenizer, WhisperConfig, WhisperFeatureExtractor
 
 from .ort_qnn import make_session
@@ -293,7 +292,7 @@ class WhisperSmallQuantizedQNNSTT:
             pos, self.attn_max_len, max_new_tokens
         )
 
-        self._block_eot_steps = 8   # Fix 4: block EOS/EOT for first N generation selections
+        self._block_eot_steps = 8
 
         # We already have logits from the last prefill step (unless prompt was empty)
         for step in range(max_new_tokens):
@@ -397,29 +396,6 @@ class WhisperSmallQuantizedQNNSTT:
 
         # fallback
         return features.astype(np.float32)
-
-    def _mel_filterbank(self, n_mels: int, n_fft: int, sample_rate: int) -> torch.Tensor:
-        def hz_to_mel(freq: float) -> float:
-            return 2595.0 * np.log10(1.0 + freq / 700.0)
-
-        def mel_to_hz(mel: float) -> float:
-            return 700.0 * (10 ** (mel / 2595.0) - 1.0)
-
-        mel_min = hz_to_mel(0)
-        mel_max = hz_to_mel(sample_rate / 2)
-        mel_points = np.linspace(mel_min, mel_max, n_mels + 2)
-        hz_points = mel_to_hz(mel_points)
-        bin_frequencies = np.floor((n_fft + 1) * hz_points / sample_rate).astype(int)
-
-        filter_bank = np.zeros((n_mels, n_fft // 2 + 1))
-        for i in range(1, n_mels + 1):
-            start, center, end = bin_frequencies[i - 1 : i + 2]
-            if center > start:
-                filter_bank[i - 1, start:center] = (np.arange(start, center) - start) / (center - start)
-            if end > center:
-                filter_bank[i - 1, center:end] = (end - np.arange(center, end)) / (end - center)
-
-        return torch.from_numpy(filter_bank).float()
 
     # --------------------------
     # Decoder step + token selection
@@ -546,11 +522,7 @@ class WhisperSmallQuantizedQNNSTT:
         if x.ndim != 1:
             x = x.reshape(-1)
 
-        # Treat uint16 logits as plain integer scores (no packed-fp16 decoding).
-        if x.dtype == np.uint16:
-            scores = x.astype(np.float32)
-        else:
-            scores = x.astype(np.float32)
+        scores = x.astype(np.float32)
 
         eot = int(getattr(self.tokenizer, "eos_token_id", -1))
         if getattr(self, "_block_eot_steps", 0) > 0 and 0 <= eot < scores.shape[0]:
@@ -650,11 +622,10 @@ class WhisperSmallQuantizedQNNSTT:
         cache: dict[str, np.ndarray] = {}
         for node in self.decoder_io.inputs:
             if node.name in self.kv_self_in_names:
-                shape = tuple(int(d) for d in node.shape)  # fully static
-                #cache[node.name] = np.zeros(shape, dtype=self._numpy_dtype_from_ort(node.type))
+                shape = tuple(int(d) for d in node.shape)
                 dtype = self._numpy_dtype_from_ort(node.type)
                 if dtype == np.uint8:
-                    cache[node.name] = np.full(shape, 128, dtype=np.uint8)  # ✅ common zero-point
+                    cache[node.name] = np.full(shape, 128, dtype=np.uint8)
                 else:
                     cache[node.name] = np.zeros(shape, dtype=dtype)
         return cache
