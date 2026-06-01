@@ -173,8 +173,6 @@ class WakeWordDetector:
     def start(self):
         """Start wake word listening."""
 
-        print("Starting wake word detector")
-
         if self.is_listening:
             self.logger.warning("The detector is already running")
             return

@@ -25,22 +25,22 @@ Microphone
 WakeWordDetector (openWakeWord, background thread)
     │  wake word detected
     ▼
-AudioRecorder (PyAudio + silence detection)
-    │  .wav file
-    ▼
-WhisperSmallQuantizedQNNSTT (ONNX Runtime + QNNExecutionProvider)
-    │  transcription text
-    ▼
-MultiLanguageTranslator (facebook/m2m100_418M, HuggingFace)
+AudioRecorder          ──────────── "translate" ──────────►  WhisperQnnSTT (NPU)
+    │  "detect"                                                    │  transcription
+    ▼                                                              ▼
+Camera (OpenCV)                                            MultiLanguageTranslator
+    │  frame                                               (facebook/m2m100_418M)
+    ▼                                                              │  translated text
+EasyOcrQnn (NPU)                                                   ▼
+    │  extracted text                              TTS (Windows SAPI / pyttsx3)
+    ▼                                                              │
+MultiLanguageTranslator ◄──────────────────────────────────────────
     │  translated text
     ▼
-TTS (_TTS via Windows SAPI / pyttsx3)
-    │
-    ▼
-Speaker output
+CaptionsClient → AR subtitle overlay
 ```
 
-The `WakeWordTranslationAssistant` orchestrates the full loop; `TranslatorPipeline` owns the STT/translation/TTS components.
+`WakeWordTranslationAssistant` orchestrates the full loop. After wake word detection it routes to **translate mode** (speech → STT → translate → TTS) or **detect mode** (camera → OCR → translate → captions + TTS). `TranslatorPipeline` owns the STT/translation/TTS/OCR components and records per-session performance metrics.
 
 ---
 
@@ -88,8 +88,10 @@ PyAudio may require OS-specific build tooling (e.g. `pipwin install pyaudio` on 
 
 | Model | How to obtain |
 |---|---|
-| QNN Whisper encoder | Export from `openai/whisper-small` with Qualcomm AI Hub or ONNX export tools; quantize to INT8/FP16 |
+| QNN Whisper encoder | Export from `openai/whisper-small` (or `large-v3-turbo`) with Qualcomm AI Hub or ONNX export tools; quantize to INT8/FP16 |
 | QNN Whisper decoder | Same export pipeline as encoder |
+| QNN EasyOCR detector | Export EasyOCR's CRAFT detector to ONNX via Qualcomm AI Hub |
+| QNN EasyOCR recogniser | Export EasyOCR's recogniser to ONNX via Qualcomm AI Hub |
 | M2M100 | Downloaded automatically from HuggingFace on first run |
 | Wake word | `openwakeword` downloads `hey_jarvis` automatically on first run |
 
@@ -135,6 +137,20 @@ python -m src.wake_translation_assistant \
   --tts-timeout 5
 ```
 
+### OCR detect mode (read and translate printed text via AR glasses)
+
+```bash
+python -m src.wake_translation_assistant \
+  --source-lang en \
+  --target-lang fr \
+  --qnn-encoder-dir models/whisper_small_quantized_encoder_optimized_onnx \
+  --qnn-decoder-dir models/whisper_small_quantized_decoder_optimized_onnx \
+  --ocr-detector-onnx models/easyocr_detector.onnx \
+  --ocr-recognizer-onnx models/easyocr_recognizer.onnx
+```
+
+Say **"hey Jarvis"**, then **"detect"**. The camera captures a frame, OCR extracts the text, and the translation is spoken and shown as AR subtitles.
+
 ### Single translation (no wake word)
 
 ```bash
@@ -151,11 +167,14 @@ python -m src.translator \
 | Flag | Description |
 |---|---|
 | `--stay-awake` | Keep translating after each phrase without re-triggering the wake word |
+| `--stt-model` | Whisper model profile: `small-quantized` (default) or `large-v3-turbo` |
 | `--no-speak` | Disable TTS output |
 | `--no-prompt` | Skip the spoken prompt before recording |
 | `--tts-timeout N` | Stop TTS playback after N seconds |
 | `--wake-debug` | Log wake word scores every second for microphone/detection debugging |
 | `--wake-mic-index N` | Force a specific PyAudio input device index for wake word detection |
+| `--ocr-detector-onnx` | Path to the QNN EasyOCR detector ONNX model |
+| `--ocr-recognizer-onnx` | Path to the QNN EasyOCR recogniser ONNX model |
 
 ### CPU fallback (debugging without QNN hardware)
 

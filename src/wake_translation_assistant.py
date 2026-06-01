@@ -520,7 +520,7 @@ class WakeWordTranslationAssistant:
             error_stage = "ocr_scan"
             if self.translation.tts:
                 self.translation.speak_text("Camera or OCR failed.", timeout_s=self.tts_timeout, show_caption=True)
-            print("Detect error:", e)
+            self.logger.exception("OCR scan failed: %s", e)
             self.translation.performance.complete_ocr_cycle(ocr_cycle, success=False, error_stage=error_stage)
             return
 
@@ -535,7 +535,7 @@ class WakeWordTranslationAssistant:
             self.translation.performance.complete_ocr_cycle(ocr_cycle, success=False, error_stage=None)
             return
 
-        print("OCR text:\n", text)
+        self.logger.info("OCR text: %s", text)
 
         # Store original OCR text and show it first, without translating
         self._ocr_original_text = text
@@ -615,7 +615,7 @@ class WakeWordTranslationAssistant:
                     self._show_current_ocr_page()
                 continue
 
-            print(f"OCR command: {command_text}")
+            self.logger.info("OCR command: %s", command_text)
             intent = self._get_ocr_command(command_text)
             self.translation.performance.record_ocr_command(
                 ocr_cycle,

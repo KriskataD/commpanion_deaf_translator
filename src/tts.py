@@ -15,7 +15,10 @@ except ImportError:  # pragma: no cover - only needed on Windows
     pythoncom = None
     win32_client = None
 
-CHUNK_REGEX = re.compile(r".*?[\.!?…](?:\s|$)")  # Regex to match complete sentence-like segments
+CHUNK_REGEX = re.compile(r".*?[\.!?…](?:\s|$)")
+
+logger = logging.getLogger(__name__)
+
 
 class _TTS:
     """
@@ -64,7 +67,7 @@ class _TTS:
             text_ (str): The sentence or phrase to be vocalized.
             timeout_s (float | None): Optional timeout for speech playback in seconds.
         """
-        print(f"🎤 Vocal synthesis: {text_}")
+        logger.info("TTS speaking: %s", text_)
         done = threading.Event()
         self._queue.put((text_, timeout_s, done))
         done.wait()
@@ -152,7 +155,7 @@ class _TTS:
                     if timeout_s is not None:
                         playback.join(timeout=timeout_s)
                         if playback.is_alive():
-                            print(f"⚠️ TTS timeout after {timeout_s:.1f}s; stopping playback.")
+                            logger.warning("TTS timeout after %.1fs; stopping playback.", timeout_s)
                             self.engine.stop()
                     else:
                         playback.join()
@@ -214,5 +217,5 @@ def talk_stream(stream) -> str:
     if leftover:
         tts.start(leftover)
 
-    print(f"\n\nResponse time: {time.time() - start_time:.3f} seconds")
+    logger.info("Response time: %.3f seconds", time.time() - start_time)
     return full_text

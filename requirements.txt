@@ -16,9 +16,12 @@ pyttsx3
 pywin32
 comtypes
 
+# OCR
+easyocr
+opencv-python
+
 # YOLOv8 + optional LM Studio helper
 ultralytics
-opencv-python
 lmstudio
 
 # Optional performance metrics
